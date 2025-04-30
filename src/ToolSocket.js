@@ -17,8 +17,10 @@ class ToolSocket {
      * @param {?URL} [url] - The URL to connect to
      * @param {?string} [networkId] - The network ID
      * @param {?string} [origin] - The origin
+     * @param {?Object} [wsOptions] - Additional options passed to the WebSocket constructor.
+     * @param {?Object} [wsOptions.headers] - Optional headers to include during the WebSocket handshake (e.g., Authorization).
      */
-    constructor(url, networkId, origin) {
+    constructor(url, networkId, origin, wsOptions = {}) {
         this.url = null;
         this.networkId = null;
         this.origin = null;
@@ -40,6 +42,8 @@ class ToolSocket {
         this.socket = null;
 
         if (url) {
+            // store extra options so we can reuse them on reconnect
+            this.wsOptions = wsOptions;
             this.connect(url, networkId, origin);
         } else if (isBrowser) {
             url = new URL(window.location.href);
@@ -95,6 +99,7 @@ class ToolSocket {
 
         this.socket = new WebSocketWrapper(this.url, [], {
             maxPayload: MAX_MESSAGE_SIZE,
+            ...this.wsOptions
         });
         this.configureSocket();
     }
