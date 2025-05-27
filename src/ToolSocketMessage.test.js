@@ -1,4 +1,4 @@
-/* global describe, test, expect, beforeEach */
+/* global describe, test, expect */
 
 const ToolSocketMessage = require('./ToolSocketMessage.js');
 
