@@ -1,4 +1,4 @@
-/* global describe, test, expect, beforeEach, beforeAll, afterEach, afterAll, jest */
+/* global describe, test, expect, beforeEach, beforeAll, afterEach, afterAll */
 const ToolSocket = require('./index.js');
 
 describe('ToolSocket', () => {
