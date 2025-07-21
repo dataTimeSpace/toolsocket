@@ -30,7 +30,7 @@
   },
   "homepage": "https://github.com/ptcrealitylab/toolsocket#readme",
   "dependencies": {
-    "ws": "^8.18.2"
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@babel/preset-env": "^7.27.2",
