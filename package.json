@@ -33,7 +33,7 @@
     "ws": "^8.18.2"
   },
   "devDependencies": {
-    "@babel/preset-env": "^7.27.2",
+    "@babel/preset-env": "^7.28.3",
     "esbuild": "^0.25.5",
     "eslint": "^9.31.0",
     "globals": "^16.2.0",
