@@ -33,9 +33,11 @@
   },
   "homepage": "https://github.com/ptcrealitylab/toolsocket#readme",
   "dependencies": {
-    "bufferutil": "^4.1.0",
-    "utf-8-validate": "^6.0.6",
     "ws": "^8.20.1"
+  },
+  "optionalDependencies": {
+    "bufferutil": "^4.1.0",
+    "utf-8-validate": "^6.0.6"
   },
   "devDependencies": {
     "@babel/preset-env": "^7.27.2",
