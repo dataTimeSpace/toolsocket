@@ -74,6 +74,12 @@ if (!isBrowser) { try { nodeCrypto = require('crypto'); } catch (_e) { /* no int
 const nowMs = (!isBrowser && typeof process !== 'undefined' && process.hrtime)
     ? () => Number(process.hrtime.bigint()) / 1e6   // sub-ms precision for rate/RTT estimation
     : () => Date.now();
+// setImmediate is a Node-only global (browsers throw ReferenceError). The
+// fallback must be a MACROTASK (setTimeout 0), not queueMicrotask/Promise:
+// the scheduler pump yields between frames so incoming messages and socket
+// events get processed during a long drain — a microtask would run before
+// I/O and starve them.
+const defer = (typeof setImmediate === 'function') ? setImmediate : (fn) => setTimeout(fn, 0);
 
 const MB = 1024 * 1024;
 // ---------------------------------------------------------------------------
@@ -240,14 +246,14 @@ class NBScheduler {
                 frames = item.build(); // lazy framing: at most one chunkSize memcpy per turn
             } catch (e) {
                 console.warn('ToolSocketNB: frame build failed, skipping item', e);
-                setImmediate(step);
+                defer(step);
                 return;
             }
             if (!Array.isArray(frames)) frames = [frames];
             this.maybeLow();
             if (!isBrowser) {
                 let pending = frames.length;
-                const next = () => { if (--pending === 0) setImmediate(step); };
+                const next = () => { if (--pending === 0) defer(step); };
                 for (const f of frames) {
                     try { sock.send(f, next); } catch (_e) { next(); }
                 }
@@ -256,7 +262,7 @@ class NBScheduler {
                 setTimeout(step, 0); // browsers: pace via bufferedAmount check above
             }
         };
-        setImmediate(step);
+        defer(step);
     }
 
     maybeLow() {
