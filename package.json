@@ -1,13 +1,16 @@
 {
   "name": "toolsocket",
-  "version": "2.1.2",
-  "description": "A communication layer built on top of WebSocket for Node.js and browsers.",
+  "version": "2.1.2-nb.4",
+  "description": "A communication layer built on top of WebSocket for Node.js and browsers. Includes ToolSocketNB: a non-blocking, prioritized, flow-controlled transport layer (API-compatible).",
   "main": "src/index.js",
   "scripts": {
     "test": "npm run build && npm run lint && jest",
     "coverage": "jest --coverage",
     "lint": "eslint .",
-    "build": "esbuild src/index.js --bundle --minify --outfile=dist/toolsocket.js --format=iife --global-name=ToolSocket --external:ws"
+    "build": "esbuild src/index.js --bundle --minify --outfile=dist/toolsocket.js --format=iife --global-name=ToolSocket --external:ws",
+    "build:browser": "esbuild src/index.browser.js --bundle --minify --outfile=dist/toolsocket.browser.js --format=iife --global-name=ToolSocket --external:ws --external:os --external:crypto",
+    "test:conformance-nb": "jest -c jest.nb.config.json",
+    "test:nb": "node test-nb/nb_smoke.js && node test-nb/nb_reconnect.js && node test-nb/nb_priority.js"
   },
   "repository": {
     "type": "git",
@@ -30,6 +33,8 @@
   },
   "homepage": "https://github.com/ptcrealitylab/toolsocket#readme",
   "dependencies": {
+    "bufferutil": "^4.1.0",
+    "utf-8-validate": "^6.0.6",
     "ws": "^8.20.1"
   },
   "devDependencies": {
