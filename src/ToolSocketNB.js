@@ -108,7 +108,9 @@ rebuildExtIndex();
 const NUM_CLASSES = 6;
 
 const DEFAULTS = {
-    chunkSize: 64 * 1024,        // hard-capped at 4MB below; 64KB = fine preemption granularity, ~0.2% overhead
+    chunkSize: 256 * 1024,       // hard-capped at 4MB below; 256KB = 4x fewer chunks than 64KB (less per-chunk
+                                 // scheduler/framing CPU on the legacy-fallback path), ~4ms preemption @1Gbit /
+                                 // ~40ms @100Mbit — realtime still preempts bulk at chunk boundaries
     ackWindow: 4,                // INITIAL chunks in flight per transfer (0 = flood/disable flow control)
     adaptiveWindow: true,        // grow/shrink the per-transfer window from measured ack RTT + delivery rate
     latencyBudgetMs: 250,        // adaptive cap: keep in-flight <= bandwidth x this budget (bounds JSON delay)
