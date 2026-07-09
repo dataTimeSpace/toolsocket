@@ -226,12 +226,43 @@ class ToolSocket {
      * Initiates the ping interval
      */
     setupPingInterval() {
+        // Liveness watchdog. The reconnect logic fires only on a 'close' event, but a
+        // silently half-open connection (NAT/firewall idle-drop, cellular<->wifi handoff, a
+        // dead TCP that never delivers a FIN) never produces one — the socket sits in
+        // readyState OPEN forever and the client becomes a zombie that receives nothing and
+        // never reconnects. So track inbound liveness: any inbound frame (a pong reply alone
+        // guarantees traffic every 5s on a healthy link) refreshes it; if nothing arrives for
+        // LIVENESS_DEADLINE_MS we force-close the RAW socket — this.socket.close(), NOT
+        // this.close() which sets userClosed and would suppress reconnect — so the 'close'
+        // handler fires and the reconnect loop re-establishes the connection.
+        const LIVENESS_DEADLINE_MS = 16000; // ~3 missed 5s pings; below the proxy's 20s reaper
+        let lastInbound = Date.now();
+        this.socket.addEventListener('message', () => {
+            lastInbound = Date.now();
+        });
         const autoPing = () => {
+            if (Date.now() - lastInbound > LIVENESS_DEADLINE_MS) {
+                // Silent half-open: no inbound for the deadline and no 'close' will come.
+                // Stop this ping loop and force a FRESH connection. We must NOT just wait for
+                // this.socket.close() to fire 'close' — a graceful close handshake hangs on an
+                // unresponsive peer, wedging the socket in CLOSING forever (no 'close', so the
+                // reconnect never fires). this.connect() replaces this.socket with a new
+                // connection; the reconnect layer stays armed on the ToolSocket for later drops.
+                clearInterval(interval);
+                try {
+                    this.socket.close();
+                } catch (_e) { /* best effort; we're replacing it anyway */ }
+                this.connect(this.url, this.networkId, this.origin);
+                return;
+            }
             this.ping('action/ping', null, () => {
                 this.triggerEvent('pong');
             });
         };
-        const interval = setInterval(autoPing, 2000);
+        // 2s was aggressive keepalive traffic (ping+pong per socket every 2s). 5s cuts
+        // that ~2.5x; the proxy's ping-deadline reaper is widened to match. The immediate
+        // autoPing() below still runs first so cloud-proxy network setup is unaffected.
+        const interval = setInterval(autoPing, 5000);
         autoPing(); // Must ping before messages get sent so that cloud-proxy can set up network properly
         this.socket.addEventListener('close', () => {
             clearInterval(interval);
