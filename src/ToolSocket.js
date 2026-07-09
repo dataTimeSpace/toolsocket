@@ -231,7 +231,10 @@ class ToolSocket {
                 this.triggerEvent('pong');
             });
         };
-        const interval = setInterval(autoPing, 2000);
+        // 2s was aggressive keepalive traffic (ping+pong per socket every 2s). 5s cuts
+        // that ~2.5x; the proxy's ping-deadline reaper is widened to match. The immediate
+        // autoPing() below still runs first so cloud-proxy network setup is unaffected.
+        const interval = setInterval(autoPing, 5000);
         autoPing(); // Must ping before messages get sent so that cloud-proxy can set up network properly
         this.socket.addEventListener('close', () => {
             clearInterval(interval);
