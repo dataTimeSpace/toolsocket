@@ -7,6 +7,11 @@ const { generateUniqueId, addSearchParams, isBrowser, WebSocketWrapper } = requi
 const { VALID_METHODS, MAX_MESSAGE_SIZE } = require('./constants.js');
 const { URL_SCHEMA, MESSAGE_BUNDLE_SCHEMA } = require('./schemas.js');
 
+// [TS-DIAG] Instances with a live socket, so ToolSocket.setDiag(true) can instrument
+// already-open connections. Entries are removed when their socket closes, so the set
+// only ever holds currently-open sockets (no leak on servers with connection churn).
+const diagSockets = new Set();
+
 /**
  * A WebSocket-based connection library that allows for file-sending, response callbacks,
  * and automatic re-connection
@@ -40,6 +45,7 @@ class ToolSocket {
         this.queuedMessages = []; // For messages sent while not connected
 
         this.socket = null;
+        this._diag = null; // [TS-DIAG] instrumentation handle, see installDiagnostics()
 
         if (url) {
             // store extra options so we can reuse them on reconnect
@@ -219,7 +225,101 @@ class ToolSocket {
                 this.routeMessage(new Uint8Array(event.data));
             }
         });
+        const sock = this.socket;
+        diagSockets.add(this);
+        sock.addEventListener('close', () => {
+            // Only unregister if this socket is still the instance's current one — the
+            // watchdog replaces this.socket BEFORE the old socket's 'close' fires, and
+            // that late close must not evict a live instance from the registry.
+            if (this.socket === sock) {
+                diagSockets.delete(this);
+            }
+        });
+        if (ToolSocket.DIAG) {
+            this.installDiagnostics();
+        }
         this.setupPingInterval();
+    }
+
+    /**
+     * Passive connection diagnostics for debugging middlebox behavior (zero-trust
+     * gateways, TLS-inspecting proxies). Listeners are ATTACHED here and DETACHED in
+     * removeDiagnostics() — when ToolSocket.DIAG is off, none of this exists on the
+     * socket and the hot path does zero diagnostic work. Toggling live is handled by
+     * ToolSocket.setDiag(), which (un)installs on every registered open socket.
+     * Three signals:
+     *  - close forensics: code/wasClean/age/quiet-time distinguish a silent drop
+     *    (1006, never cleanly closed) from a gateway's clean idle close, and a
+     *    consistent age at death exposes periodic re-auth/token kills
+     *  - inbound gap: timestamps every stall so it can be correlated with gateway logs
+     *  - burst arrivals: many messages inside one 100ms window right after a gap is
+     *    the hold-and-flush signature of a buffering/inspecting hop (not congestion)
+     */
+    installDiagnostics() {
+        if (this._diag && this._diag.socket === this.socket) {
+            return; // current socket already instrumented
+        }
+        this.removeDiagnostics(); // drop instrumentation left on a replaced socket
+        const socket = this.socket;
+        // openedAt stays null when installing on an already-open socket (enabled
+        // mid-connection); lastInbound baselines to install time so the first gap
+        // measurement is real, not the time since some pre-diag message.
+        const state = { openedAt: null, lastInbound: Date.now(), burstCount: 0, burstTimer: null };
+        const onOpen = () => {
+            state.openedAt = Date.now();
+            state.lastInbound = state.openedAt;
+            console.info(`[TS-DIAG] open ${this.url}`);
+        };
+        const onMessage = () => {
+            const now = Date.now();
+            const gap = now - state.lastInbound;
+            if (gap > 4000) {
+                console.warn(`[TS-DIAG] inbound gap ${(gap / 1000).toFixed(1)}s ended at ${new Date(now).toISOString()} url=${this.url}`);
+            }
+            state.burstCount++;
+            if (!state.burstTimer) {
+                state.burstTimer = setTimeout(() => {
+                    if (state.burstCount > 5) {
+                        console.warn(`[TS-DIAG] burst: ${state.burstCount} messages in one 100ms window url=${this.url}`);
+                    }
+                    state.burstCount = 0;
+                    state.burstTimer = null;
+                }, 100);
+            }
+            state.lastInbound = now;
+        };
+        const onClose = (event) => {
+            if (state.burstTimer) {
+                clearTimeout(state.burstTimer);
+                state.burstTimer = null;
+            }
+            const now = Date.now();
+            const age = state.openedAt ? `${((now - state.openedAt) / 1000).toFixed(1)}s` : 'unknown (diag enabled mid-connection)';
+            console.warn(`[TS-DIAG] close code=${event.code} clean=${event.wasClean} reason="${event.reason || ''}" age=${age} sinceLastInbound=${((now - state.lastInbound) / 1000).toFixed(1)}s url=${this.url}`);
+        };
+        socket.addEventListener('open', onOpen);
+        socket.addEventListener('message', onMessage);
+        socket.addEventListener('close', onClose);
+        this._diag = { socket, state, onOpen, onMessage, onClose };
+    }
+
+    /**
+     * Detaches the [TS-DIAG] listeners installed by installDiagnostics(), restoring
+     * the zero-overhead state. Safe to call when nothing is installed.
+     */
+    removeDiagnostics() {
+        if (!this._diag) {
+            return;
+        }
+        const { socket, state, onOpen, onMessage, onClose } = this._diag;
+        if (state.burstTimer) {
+            clearTimeout(state.burstTimer);
+            state.burstTimer = null;
+        }
+        socket.removeEventListener('open', onOpen);
+        socket.removeEventListener('message', onMessage);
+        socket.removeEventListener('close', onClose);
+        this._diag = null;
     }
 
     /**
@@ -240,6 +340,25 @@ class ToolSocket {
         this.socket.addEventListener('message', () => {
             lastInbound = Date.now();
         });
+        // [TS-DIAG] RTT tracking over the existing ping traffic; a steadily inflated
+        // median vs. a known-good network (same client on a hotspot) quantifies what an
+        // inspecting/buffering middlebox costs. When ToolSocket.DIAG is off the ping
+        // path pays a single boolean check every 5s — no timestamps, no allocation.
+        let diagRtts = null;
+        const diagRecordRtt = (rtt) => {
+            if (rtt > 300) {
+                console.warn(`[TS-DIAG] slow ping RTT ${rtt}ms url=${this.url}`);
+            }
+            if (!diagRtts) {
+                diagRtts = [];
+            }
+            diagRtts.push(rtt);
+            if (diagRtts.length >= 24) { // ~2 minutes of 5s pings
+                diagRtts.sort((a, b) => a - b);
+                console.info(`[TS-DIAG] RTT last ${diagRtts.length} pings: min=${diagRtts[0]} med=${diagRtts[12]} max=${diagRtts[diagRtts.length - 1]}ms url=${this.url}`);
+                diagRtts.length = 0;
+            }
+        };
         const autoPing = () => {
             if (Date.now() - lastInbound > LIVENESS_DEADLINE_MS) {
                 // Silent half-open: no inbound for the deadline and no 'close' will come.
@@ -248,6 +367,9 @@ class ToolSocket {
                 // unresponsive peer, wedging the socket in CLOSING forever (no 'close', so the
                 // reconnect never fires). this.connect() replaces this.socket with a new
                 // connection; the reconnect layer stays armed on the ToolSocket for later drops.
+                if (ToolSocket.DIAG) {
+                    console.error(`[TS-DIAG] SILENT HALF-OPEN: no inbound for ${LIVENESS_DEADLINE_MS}ms (last ${new Date(lastInbound).toISOString()}), readyState=${this.socket.readyState}, force-reconnecting ${this.url}`);
+                }
                 clearInterval(interval);
                 try {
                     this.socket.close();
@@ -255,9 +377,19 @@ class ToolSocket {
                 this.connect(this.url, this.networkId, this.origin);
                 return;
             }
-            this.ping('action/ping', null, () => {
-                this.triggerEvent('pong');
-            });
+            if (ToolSocket.DIAG) {
+                const pingSentAt = Date.now();
+                this.ping('action/ping', null, () => {
+                    if (ToolSocket.DIAG) {
+                        diagRecordRtt(Date.now() - pingSentAt);
+                    }
+                    this.triggerEvent('pong');
+                });
+            } else {
+                this.ping('action/ping', null, () => {
+                    this.triggerEvent('pong');
+                });
+            }
         };
         // 2s was aggressive keepalive traffic (ping+pong per socket every 2s). 5s cuts
         // that ~2.5x; the proxy's ping-deadline reaper is widened to match. The immediate
@@ -638,5 +770,46 @@ class ToolSocket {
         return new ToolSocket(toolsocket.url, toolsocket.networkId, 'parallel');
     }
 }
+
+// [TS-DIAG] Connection-diagnostics flag. Off by default, and when off NO diagnostic
+// code runs — the listeners are physically detached, not gated. DIAG is a
+// getter/setter, so BOTH forms instrument/detach every live socket immediately:
+//   ToolSocket.setDiag(true)   // persists across reloads (localStorage)
+//   ToolSocket.DIAG = true     // this page load only
+let diagEnabled = false;
+Object.defineProperty(ToolSocket, 'DIAG', {
+    get() {
+        return diagEnabled;
+    },
+    set(on) {
+        on = !!on;
+        if (on === diagEnabled) {
+            return;
+        }
+        diagEnabled = on;
+        diagSockets.forEach((ts) => {
+            if (on) {
+                ts.installDiagnostics();
+            } else {
+                ts.removeDiagnostics();
+            }
+        });
+    },
+});
+if (isBrowser) {
+    try {
+        ToolSocket.DIAG = window.localStorage.getItem('toolsocket-diag') === '1';
+    } catch (_e) { /* storage blocked (private mode / iframe); stay off */ }
+}
+ToolSocket.setDiag = function(on) {
+    ToolSocket.DIAG = !!on;
+    if (isBrowser) {
+        try {
+            window.localStorage.setItem('toolsocket-diag', on ? '1' : '0');
+        } catch (_e) { /* storage blocked; flag still applies to this page load */ }
+    }
+    console.info(`[TS-DIAG] connection diagnostics ${diagEnabled ? 'ON' : 'OFF'} (${diagSockets.size} live socket${diagSockets.size === 1 ? '' : 's'})`);
+    return diagEnabled;
+};
 
 module.exports = ToolSocket;
