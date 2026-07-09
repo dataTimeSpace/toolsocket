@@ -1,8 +1,0 @@
-{
-  "moduleNameMapper": {
-    "^\\./index\\.js$": "<rootDir>/src/index.nbshim.js"
-  },
-  "testMatch": [
-    "**/src/**/*.test.js"
-  ]
-}
