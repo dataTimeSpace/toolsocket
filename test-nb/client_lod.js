@@ -84,7 +84,13 @@ for (const { name, port } of specs) {
 
     for (let seq = 0; seq < NMSG; seq++) {
         const at = T0 + Math.floor(rand() * WINDOW_MS);
-        setTimeout(() => { try { sock.io('/json', { from: name, seq, sentAt: Date.now(), pad }); } catch (e) { } }, Math.max(0, at - Date.now()));
+        setTimeout(() => {
+            try {
+                sock.io('/json', { from: name, seq, sentAt: Date.now(), pad });
+            } catch (e) {
+                console.warn('unable to call io json', e);
+            }
+        }, Math.max(0, at - Date.now()));
     }
 }
 
@@ -112,6 +118,12 @@ const checker = setInterval(() => {
     }
 }, 1000);
 process.on('SIGTERM', () => {
-    for (const st of states) { try { fs.writeFileSync(path.join(LOGDIR, `${st.name}.summary.json`), JSON.stringify(summarize(st))); } catch (e) { } }
+    for (const st of states) {
+        try {
+            fs.writeFileSync(path.join(LOGDIR, `${st.name}.summary.json`), JSON.stringify(summarize(st)));
+        } catch (e) {
+            console.error('unable to persist on terminate', e);
+        }
+    }
     process.exit(0);
 });
