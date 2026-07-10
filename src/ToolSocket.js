@@ -252,7 +252,16 @@ class ToolSocket {
                 try {
                     this.socket.close();
                 } catch (_e) { /* best effort; we're replacing it anyway */ }
-                this.connect(this.url, this.networkId, this.origin);
+                if (this.url) {
+                    // outbound socket: dial a fresh connection
+                    this.connect(this.url, this.networkId, this.origin);
+                } else if (this.socket.terminate) {
+                    // server-side incoming socket (IncomingToolSocket, url=null): there is
+                    // nothing to dial — connect(null) would throw and crash the server.
+                    // Terminate the dead transport so 'close' fires and the server reaps
+                    // the connection; the CLIENT's own watchdog/reconnect re-establishes.
+                    try { this.socket.terminate(); } catch (_e) { /* already dead */ }
+                }
                 return;
             }
             this.ping('action/ping', null, () => {
