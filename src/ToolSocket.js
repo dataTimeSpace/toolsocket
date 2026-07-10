@@ -260,7 +260,9 @@ class ToolSocket {
                     // nothing to dial — connect(null) would throw and crash the server.
                     // Terminate the dead transport so 'close' fires and the server reaps
                     // the connection; the CLIENT's own watchdog/reconnect re-establishes.
-                    try { this.socket.terminate(); } catch (_e) { /* already dead */ }
+                    try {
+                        this.socket.terminate();
+                    } catch (_e) { /* already dead */ }
                 }
                 return;
             }
