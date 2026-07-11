@@ -1,23 +1,43 @@
 /**
- * ToolSocketInfo — live info/diagnostics reporting for a ToolSocket connection.
+ * ToolSocketInfo — live info reporting for a ToolSocket connection.
  *
  * This module is ONLY loaded when ToolSocket.info(true, callback) is called for the
  * first time. While info mode is off, none of this code is loaded or executed and the
- * ToolSocket hot paths (send / routeMessage) carry zero extra work: observation happens
- * exclusively through ToolSocket's event system, whose triggerEvent() early-returns
- * when no listeners are registered.
+ * ToolSocket hot paths carry zero extra work: observation happens exclusively through
+ * ToolSocket's event system, whose triggerEvent() early-returns with no listeners.
  *
- * Every info update delivered to the callback uses this envelope:
+ * Reporting model: data is collected continuously while enabled and pushed to the
+ * callback every REPORT_INTERVAL_MS (5 seconds) as:
  *   {
- *     type:      string  — what kind of update this is (e.g. 'open', 'close', 'status')
- *     timestamp: number  — Date.now() at the moment of the update
- *     data:      object  — type-specific content
+ *     type:      'info'
+ *     timestamp: number  — Date.now() at the moment the report is pushed
+ *     data: {
+ *       latency: {
+ *         currentMs: number  — round trip time of the most recent ping/pong
+ *         averageMs: number  — average over samples since the last report
+ *         minMs:     number  — fastest sample since the last report
+ *         maxMs:     number  — slowest sample since the last report
+ *         samples:   number  — how many pings were measured since the last report
+ *       } | null             — null if no ping completed since the last report
+ *     }
  *   }
  *
- * NOTE: The concrete info content is being defined incrementally. The lifecycle hooks
- * below are plumbing that proves the enable/disable/teardown mechanics work; the real
- * payloads will be built out in the marked section.
+ * How latency is measured: ToolSocket's built-in keepalive sends a 'ping' message
+ * (route 'action/ping') every ~5s with a response callback, which assigns it a message
+ * id. We listen to the 'send' event to record the send time of each ping id, and to
+ * the 'res' event to match the incoming response id back to it. The difference is the
+ * application-level round trip time. This works on both outbound (client) sockets and
+ * server-side IncomingToolSockets, since both run the same keepalive loop.
  */
+
+const REPORT_INTERVAL_MS = 5000;
+// Drop pending pings that never got a response (e.g. connection dropped mid-flight)
+const PENDING_PING_TIMEOUT_MS = 30000;
+
+const now = (typeof performance !== 'undefined' && performance.now)
+    ? () => performance.now()
+    : () => Date.now();
+
 class ToolSocketInfo {
     /**
      * @param {Object} toolsocket - The ToolSocket instance to observe
@@ -33,10 +53,19 @@ class ToolSocketInfo {
          * @type {Object<string, function>}
          */
         this.listeners = {};
+        /** @type {?ReturnType<setInterval>} */
+        this.reportInterval = null;
+
+        /** @type {Object<string, number>} ping message id -> send time */
+        this.pendingPings = {};
+        /** @type {number[]} completed round trip times since the last report */
+        this.latencySamples = [];
+        /** @type {?number} most recent completed round trip time */
+        this.lastLatencyMs = null;
     }
 
     /**
-     * Sets (or replaces) the callback that receives info updates
+     * Sets (or replaces) the callback that receives info reports
      * @param {?function} callback
      */
     setCallback(callback) {
@@ -44,7 +73,7 @@ class ToolSocketInfo {
     }
 
     /**
-     * Attaches listeners and begins delivering info updates. Idempotent.
+     * Attaches listeners and starts the 5 second reporting cycle. Idempotent.
      */
     start() {
         if (this.active) {
@@ -52,49 +81,100 @@ class ToolSocketInfo {
         }
         this.active = true;
 
-        // ------------------------------------------------------------------
-        // Info sources — TO BE DEFINED
-        // The hooks below are minimal plumbing. The actual info content that
-        // the callback provides will be designed and implemented here.
-        // ------------------------------------------------------------------
-        this._listen('open', () => this._emit('open', this.connectionSnapshot()));
-        this._listen('close', () => this._emit('close', this.connectionSnapshot()));
-        this._listen('error', () => this._emit('error', this.connectionSnapshot()));
-        this._listen('status', (readyState) => this._emit('status', {readyState}));
+        // --- latency collection ------------------------------------------
+        // Record the send time of every outgoing ping that expects a response
+        this._listen('send', (messageBundle) => {
+            const message = messageBundle && messageBundle.message;
+            if (message && message.method === 'ping' && message.id) {
+                this.pendingPings[message.id] = now();
+            }
+        });
+        // Match incoming responses back to their ping by message id
+        this._listen('res', (_route, _body, _response, _binaryData, messageBundle) => {
+            const message = messageBundle && messageBundle.message;
+            if (!message || !message.id) {
+                return;
+            }
+            const sentAt = this.pendingPings[message.id];
+            if (sentAt === undefined) {
+                return;
+            }
+            delete this.pendingPings[message.id];
+            const roundTripMs = Math.round((now() - sentAt) * 10) / 10;
+            this.lastLatencyMs = roundTripMs;
+            this.latencySamples.push(roundTripMs);
+        });
 
-        // Confirm activation immediately with a snapshot of the current connection
-        this._emit('infoEnabled', this.connectionSnapshot());
+        // --- reporting cycle ---------------------------------------------
+        this.reportInterval = setInterval(() => this._report(), REPORT_INTERVAL_MS);
+        // Don't let the report interval keep a Node.js process alive on its own
+        if (this.reportInterval.unref) {
+            this.reportInterval.unref();
+        }
     }
 
     /**
-     * Detaches every listener this instance registered and stops all updates.
-     * After stop(), this instance holds no hooks into the ToolSocket.
+     * Detaches every listener, stops the reporting cycle, and clears all
+     * collected state. After stop(), this instance holds no hooks into the ToolSocket.
      */
     stop() {
         if (!this.active) {
             return;
         }
+        clearInterval(this.reportInterval);
+        this.reportInterval = null;
         for (const [eventType, handler] of Object.entries(this.listeners)) {
             this.toolsocket.removeEventListener(eventType, handler);
         }
         this.listeners = {};
+        this.pendingPings = {};
+        this.latencySamples = [];
+        this.lastLatencyMs = null;
         this.callback = null;
         this.active = false;
     }
 
     /**
-     * A minimal snapshot of the current connection state (placeholder content)
-     * @returns {Object}
+     * Assembles and pushes one info report, then resets the collection window
      */
-    connectionSnapshot() {
-        return {
-            url: this.toolsocket.url ? this.toolsocket.url.toString() : null,
-            networkId: this.toolsocket.networkId,
-            origin: this.toolsocket.origin,
-            readyState: this.toolsocket.readyState,
-            connected: this.toolsocket.connected,
-            queuedMessages: this.toolsocket.queuedMessages.length,
-        };
+    _report() {
+        this._prunePendingPings();
+
+        let latency = null;
+        if (this.latencySamples.length > 0) {
+            const sum = this.latencySamples.reduce((a, b) => a + b, 0);
+            latency = {
+                currentMs: this.lastLatencyMs,
+                averageMs: Math.round((sum / this.latencySamples.length) * 10) / 10,
+                minMs: Math.min(...this.latencySamples),
+                maxMs: Math.max(...this.latencySamples),
+                samples: this.latencySamples.length,
+            };
+        }
+        this.latencySamples = [];
+
+        if (!this.callback) {
+            return;
+        }
+        this.callback({
+            type: 'info',
+            timestamp: Date.now(),
+            data: {
+                latency: latency,
+            },
+        });
+    }
+
+    /**
+     * Drops pending ping entries that never received a response
+     */
+    _prunePendingPings() {
+        const cutoff = now() - PENDING_PING_TIMEOUT_MS;
+        for (const [id, sentAt] of Object.entries(this.pendingPings)) {
+            if (sentAt < cutoff) {
+                delete this.pendingPings[id];
+            }
+        }
     }
 
     /**
