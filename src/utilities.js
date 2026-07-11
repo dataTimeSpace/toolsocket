@@ -58,6 +58,31 @@ function addSearchParams(url, newParams) {
     return newUrl;
 }
 
+// Largest payload a throughput probe may request (see ToolSocketInfo.js)
+const MAX_PROBE_PAYLOAD_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Builds an incompressible payload for throughput probes. Random-ish content is
+ * required so that compression anywhere on the path cannot fake higher rates.
+ * Uses a fast xorshift generator; only runs when a probe is explicitly requested.
+ * @param {number} requestedBytes
+ * @returns {Uint8Array}
+ */
+function makeProbePayload(requestedBytes) {
+    const size = (typeof requestedBytes === 'number' && requestedBytes > 0)
+        ? Math.min(Math.floor(requestedBytes), MAX_PROBE_PAYLOAD_BYTES)
+        : 1024;
+    const payload = new Uint8Array(size);
+    let state = (Date.now() & 0x7fffffff) | 1;
+    for (let i = 0; i < size; i++) {
+        state ^= state << 13;
+        state ^= state >>> 17;
+        state ^= state << 5;
+        payload[i] = state & 0xff;
+    }
+    return payload;
+}
+
 const isBrowser = typeof window !== 'undefined';
 /** @type {WebSocket} */
 const WebSocketWrapper = isBrowser ? WebSocket : require('ws');
@@ -68,5 +93,6 @@ module.exports = {
     generateUniqueId,
     addSearchParams,
     isBrowser,
-    WebSocketWrapper
+    WebSocketWrapper,
+    makeProbePayload
 };

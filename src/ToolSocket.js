@@ -3,7 +3,7 @@ const ToolSocketMessage = require('./ToolSocketMessage.js');
 const ToolSocketResponse = require('./ToolSocketResponse.js');
 const MessageBundle = require('./MessageBundle.js');
 
-const { generateUniqueId, addSearchParams, isBrowser, WebSocketWrapper } = require('./utilities.js');
+const { generateUniqueId, addSearchParams, isBrowser, WebSocketWrapper, makeProbePayload } = require('./utilities.js');
 const { VALID_METHODS, MAX_MESSAGE_SIZE } = require('./constants.js');
 const { URL_SCHEMA, MESSAGE_BUNDLE_SCHEMA } = require('./schemas.js');
 
@@ -174,11 +174,24 @@ class ToolSocket {
             }
         });
 
-        this.addEventListener('meta', (route, body, _response, _binaryData, _messageBundle) => {
+        this.addEventListener('meta', (route, body, response, _binaryData, _messageBundle) => {
             if (route === 'requestParallel') {
                 this.triggerEvent('requestParallel', body); // body = id
             } else if (route === 'confirmParallel') {
                 this.triggerEvent('confirmParallel', body); // body = id
+            } else if (route === 'probe/down') {
+                // Throughput probe (see ToolSocketInfo.js): a large payload just
+                // arrived; a tiny acknowledgement lets the sender compute the
+                // downstream rate. Only runs when a probe is explicitly requested.
+                if (response) {
+                    response.send('ok');
+                }
+            } else if (route === 'probe/up') {
+                // Throughput probe: the sender asks for `body` bytes of
+                // incompressible data to measure the upstream rate
+                if (response) {
+                    response.send('ok', makeProbePayload(body));
+                }
             } else {
                 console.warn(`Received unknown meta route: "${route}"`);
             }

@@ -29,6 +29,18 @@
  *         sentBytes:             number — outgoing bytes since the last report
  *         receivedBytes:         number — incoming bytes since the last report
  *       }
+ *       probe: {          — latest throughput probe result; null until the first
+ *                            probe, then persists unchanged until the next one.
+ *                            Triggered on demand via info(true, undefined, {probe: true})
+ *         status:    'running' | 'ok' | 'failed'
+ *         timestamp: number  — when the probe finished (or started, while running)
+ *         sizeBytes: number  — payload size used per direction
+ *         rttMsAtProbe:            number — network RTT baseline subtracted from timings
+ *         downstreamBytesPerSecond: ?number — measured server -> client rate
+ *         upstreamBytesPerSecond:   ?number — measured client -> server rate
+ *         reason:    string  — only when failed, e.g. 'not-connected',
+ *                              'timeout-or-unsupported-client'
+ *       }
  *       networkQuality: { — plain-language interpretation of realtime connection quality
  *         score:  number   — 0 (unusable) to 100 (perfect realtime behavior)
  *         rating: string   — 'excellent' | 'good' | 'degraded' | 'poor'
@@ -65,6 +77,16 @@
  * close, the close code is captured and a final report is pushed: code 1000/1001 is
  * a clean end, anything else (especially 1006) means the connection was cut, which
  * is the typical signature of proxies and zero-trust gateways killing the socket.
+ *
+ * Throughput probe: an on-demand (never automatic) measurement of the maximum data
+ * rate each direction sustains. Downstream: a payload of incompressible bytes is sent
+ * to the client via meta route 'probe/down'; the client acknowledges with a tiny
+ * response, so the elapsed time minus the RTT baseline is the payload's transfer
+ * time. Upstream: meta route 'probe/up' asks the client to respond with the same
+ * amount of incompressible data. Both responders are built into ToolSocket's default
+ * meta routes and are completely passive until a probe request arrives. Probe traffic
+ * is real traffic: it will appear in that window's transport numbers, and protocol
+ * pings sent during the transfer measure latency under load.
  *
  * Scoring: each dimension maps to 0-100 through the piecewise-linear anchor tables
  * below (continuity is simply the fraction of seconds with inbound data). The overall
@@ -109,6 +131,11 @@ const BUCKETS_PER_REPORT = 5; // push a report to the callback every 5 seconds
 const PENDING_PING_TIMEOUT_MS = 30000;
 // Marks our protocol-level PING payloads so we only interpret our own PONGs
 const PROTOCOL_PING_PREFIX = 'tsinfo:';
+// Throughput probe defaults: payload per direction and overall timeout
+const DEFAULT_PROBE_SIZE_BYTES = 256 * 1024;
+const PROBE_TIMEOUT_MS = 10000;
+
+const { makeProbePayload } = require('./utilities.js');
 
 // Piecewise-linear anchor tables: [measurement, score] pairs mapping a raw value to
 // a 0-100 dimension score. Values between anchors are linearly interpolated.
@@ -209,6 +236,13 @@ class ToolSocketInfo {
         this.closeInfo = null;
         /** @type {number[]} recent overall scores, for the trend indicator */
         this.scoreHistory = [];
+
+        // --- throughput probe state ---
+        /** @type {?Object} latest probe result; persists until the next probe */
+        this.probeResult = null;
+        this.probeRunning = false;
+        /** @type {?ReturnType<setTimeout>} */
+        this.probeTimeout = null;
     }
 
     /**
@@ -325,6 +359,83 @@ class ToolSocketInfo {
     }
 
     /**
+     * Runs a one-shot throughput probe measuring the maximum sustained data rate in
+     * both directions. The result is stored in every report's data.probe until the
+     * next probe replaces it. No-op while a probe is already running.
+     * @param {number} [sizeBytes] - Payload size per direction (default 256 KB)
+     */
+    startProbe(sizeBytes) {
+        if (!this.active || this.probeRunning) {
+            return;
+        }
+        const size = (typeof sizeBytes === 'number' && sizeBytes > 0)
+            ? Math.floor(sizeBytes) : DEFAULT_PROBE_SIZE_BYTES;
+        if (!this.toolsocket.connected) {
+            this.probeResult = {
+                status: 'failed',
+                reason: 'not-connected',
+                timestamp: Date.now(),
+                sizeBytes: size,
+                rttMsAtProbe: null,
+                downstreamBytesPerSecond: null,
+                upstreamBytesPerSecond: null,
+            };
+            return;
+        }
+
+        this.probeRunning = true;
+        const rttMs = this.lastNetworkLatencyMs || 0;
+        this.probeResult = {
+            status: 'running',
+            timestamp: Date.now(),
+            sizeBytes: size,
+            rttMsAtProbe: rttMs,
+            downstreamBytesPerSecond: null,
+            upstreamBytesPerSecond: null,
+        };
+        // bytes / (elapsed minus the RTT baseline) = transfer rate of the payload
+        const toRate = (bytes, elapsedMs) =>
+            Math.round(bytes / Math.max(elapsedMs - rttMs, 0.5) * 1000);
+
+        this.probeTimeout = setTimeout(() => {
+            if (!this.probeRunning) {
+                return;
+            }
+            this.probeRunning = false;
+            this.probeResult.status = 'failed';
+            this.probeResult.reason = 'timeout-or-unsupported-client';
+            this.probeResult.timestamp = Date.now();
+        }, PROBE_TIMEOUT_MS);
+        if (this.probeTimeout.unref) {
+            this.probeTimeout.unref();
+        }
+
+        // Phase 1 — downstream: send a large incompressible payload, get a tiny ack
+        const downStart = now();
+        this.toolsocket.meta('probe/down', null, () => {
+            if (!this.probeRunning) {
+                return; // timed out in the meantime
+            }
+            this.probeResult.downstreamBytesPerSecond = toRate(size, now() - downStart);
+
+            // Phase 2 — upstream: ask the client for the same amount back
+            const upStart = now();
+            this.toolsocket.meta('probe/up', size, (_body, binaryData) => {
+                if (!this.probeRunning) {
+                    return;
+                }
+                const received = (binaryData && binaryData.byteLength) || size;
+                this.probeResult.upstreamBytesPerSecond = toRate(received, now() - upStart);
+                this.probeResult.status = 'ok';
+                this.probeResult.timestamp = Date.now();
+                this.probeRunning = false;
+                clearTimeout(this.probeTimeout);
+                this.probeTimeout = null;
+            });
+        }, makeProbePayload(size));
+    }
+
+    /**
      * 1 Hz: rolls the current second's counters into the window and tracks the peak.
      * Every BUCKETS_PER_REPORT ticks, pushes a report.
      */
@@ -422,6 +533,7 @@ class ToolSocketInfo {
                 appLatency: appLatency,
                 transport: transport,
                 networkQuality: networkQuality,
+                probe: this.probeResult,
             },
         });
     }

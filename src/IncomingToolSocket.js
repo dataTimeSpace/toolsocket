@@ -39,17 +39,32 @@ class IncomingToolSocket extends ToolSocket {
      *
      * @param {boolean} [enabled=false] - Whether info updates should be active
      * @param {?function} [infoCallback] - Called with info report objects while enabled.
+     *                                     Omit (undefined) to keep the current callback,
+     *                                     e.g. when only triggering a probe.
      *                                     Report content is defined in ToolSocketInfo.js.
+     * @param {?Object} [options] - Additional actions:
+     * @param {boolean} [options.probe] - If true, runs a one-shot throughput probe
+     *                                    (max upstream/downstream measurement). The
+     *                                    result is included in every report's
+     *                                    data.probe until the next probe replaces it.
+     *                                    Intended to be triggered by a UI button.
+     * @param {number} [options.probeSizeBytes] - Probe payload size per direction
+     *                                            (default 256 KB, capped at 4 MB)
      */
-    info(enabled = false, infoCallback) {
+    info(enabled = false, infoCallback, options) {
         if (enabled) {
             if (!this.infoHandler) {
                 // Lazy require: this module is only ever loaded once info mode is activated
                 const ToolSocketInfo = require('./ToolSocketInfo.js');
                 this.infoHandler = new ToolSocketInfo(this);
             }
-            this.infoHandler.setCallback(infoCallback || null);
+            if (infoCallback !== undefined) {
+                this.infoHandler.setCallback(infoCallback);
+            }
             this.infoHandler.start();
+            if (options && options.probe) {
+                this.infoHandler.startProbe(options.probeSizeBytes);
+            }
         } else if (this.infoHandler) {
             this.infoHandler.stop();
             this.infoHandler = null;
