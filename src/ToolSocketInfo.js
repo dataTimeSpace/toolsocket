@@ -287,8 +287,6 @@ class ToolSocketInfo {
         /** @type {?Object} latest probe result; persists until the next probe */
         this.probeResult = null;
         this.probeRunning = false;
-        /** @type {?ReturnType<setTimeout>} */
-        this.probeTimeout = null;
         // True if a probe transferred during the current report window
         this.probeActiveInWindow = false;
         // TCP counter snapshot at probe start, for measuring concurrent app traffic
@@ -423,32 +421,20 @@ class ToolSocketInfo {
      * both directions. The result is stored in every report's data.probe until the
      * next probe replaces it. No-op while a probe is already running.
      * @param {number} [sizeBytes] - Payload size per direction (default 256 KB)
+     * @param {?function} [onDone] - Called with the finished result
+     * @returns {boolean} - Whether the probe was started
      */
-    startProbe(sizeBytes) {
+    startProbe(sizeBytes, onDone) {
         if (!this.active || this.probeRunning) {
-            return;
+            return false;
         }
         const size = (typeof sizeBytes === 'number' && sizeBytes > 0)
             ? Math.floor(sizeBytes) : DEFAULT_PROBE_SIZE_BYTES;
-        if (!this.toolsocket.connected) {
-            this.probeResult = {
-                status: 'failed',
-                reason: 'not-connected',
-                timestamp: Date.now(),
-                sizeBytes: size,
-                rttMsAtProbe: null,
-                downstreamBytesPerSecond: null,
-                upstreamBytesPerSecond: null,
-            };
-            return;
-        }
-
+        const rttMs = this.lastNetworkLatencyMs || 0;
         this.probeRunning = true;
         this.probeActiveInWindow = true;
-        const rttMs = this.lastNetworkLatencyMs || 0;
-        const raw = this.toolsocket.socket && this.toolsocket.socket._socket;
-        this.probeCounterStart = (raw && typeof raw.bytesRead === 'number')
-            ? {read: raw.bytesRead, written: raw.bytesWritten} : null;
+        // The 'running' placeholder is live in reports; the pong handler also writes
+        // latencyUnderLoadMs into it while the transfer is in flight
         this.probeResult = {
             status: 'running',
             timestamp: Date.now(),
@@ -461,59 +447,18 @@ class ToolSocketInfo {
             contended: false,
             latencyUnderLoadMs: null,
         };
-        // bytes / (elapsed minus the RTT baseline) = transfer rate of the payload
-        const toRate = (bytes, elapsedMs) =>
-            Math.round(bytes / Math.max(elapsedMs - rttMs, 0.5) * 1000);
-
-        this.probeTimeout = setTimeout(() => {
-            if (!this.probeRunning) {
-                return;
-            }
+        runProbe(this.toolsocket, size, rttMs).then((result) => {
+            result.latencyUnderLoadMs = this.probeResult
+                ? this.probeResult.latencyUnderLoadMs : null;
             this.probeRunning = false;
-            this.probeResult.status = 'failed';
-            this.probeResult.reason = 'timeout-or-unsupported-client';
-            this.probeResult.timestamp = Date.now();
-        }, PROBE_TIMEOUT_MS);
-        if (this.probeTimeout.unref) {
-            this.probeTimeout.unref();
-        }
-
-        // Phase 1 — downstream: send a large incompressible payload, get a tiny ack
-        const downStart = now();
-        this.toolsocket.meta('probe/down', null, () => {
-            if (!this.probeRunning) {
-                return; // timed out in the meantime
+            if (this.active) {
+                this.probeResult = result;
             }
-            this.probeResult.downstreamBytesPerSecond = toRate(size, now() - downStart);
-
-            // Phase 2 — upstream: ask the client for the same amount back
-            const upStart = now();
-            this.toolsocket.meta('probe/up', size, (_body, binaryData) => {
-                if (!this.probeRunning) {
-                    return;
-                }
-                const received = (binaryData && binaryData.byteLength) || size;
-                this.probeResult.upstreamBytesPerSecond = toRate(received, now() - upStart);
-                // Concurrent app traffic: total wire bytes during the probe minus
-                // the probe's own payloads (envelope/frame overhead makes this an
-                // approximation, slightly overstating concurrent traffic)
-                if (this.probeCounterStart && raw && typeof raw.bytesRead === 'number') {
-                    this.probeResult.concurrentSentBytes = Math.max(0,
-                        raw.bytesWritten - this.probeCounterStart.written - size);
-                    this.probeResult.concurrentReceivedBytes = Math.max(0,
-                        raw.bytesRead - this.probeCounterStart.read - received);
-                    this.probeResult.contended =
-                        (this.probeResult.concurrentSentBytes
-                            + this.probeResult.concurrentReceivedBytes) > 0.1 * (size + received);
-                }
-                this.probeCounterStart = null;
-                this.probeResult.status = 'ok';
-                this.probeResult.timestamp = Date.now();
-                this.probeRunning = false;
-                clearTimeout(this.probeTimeout);
-                this.probeTimeout = null;
-            });
-        }, makeProbePayload(size));
+            if (typeof onDone === 'function') {
+                onDone(result);
+            }
+        });
+        return true;
     }
 
     /**
@@ -942,5 +887,97 @@ class ToolSocketInfo {
         this.toolsocket.addEventListener(eventType, handler);
     }
 }
+
+/**
+ * Runs one throughput probe on any connected ToolSocket: sends sizeBytes of
+ * incompressible data downstream (meta 'probe/down', tiny ack back), then requests
+ * the same amount upstream (meta 'probe/up'). Standalone core used both by
+ * ToolSocketInfo.startProbe and by ToolSocketServer.stagedProbe. Never rejects.
+ * @param {Object} toolsocket - Any ToolSocket (info does not need to be enabled)
+ * @param {number} [sizeBytes] - Payload per direction (default 256 KB)
+ * @param {number} [rttMs] - RTT baseline subtracted from transfer timings
+ * @returns {Promise<Object>} - The probe result object
+ */
+function runProbe(toolsocket, sizeBytes, rttMs = 0) {
+    return new Promise((resolve) => {
+        const size = (typeof sizeBytes === 'number' && sizeBytes > 0)
+            ? Math.floor(sizeBytes) : DEFAULT_PROBE_SIZE_BYTES;
+        const result = {
+            status: 'running',
+            timestamp: Date.now(),
+            sizeBytes: size,
+            rttMsAtProbe: rttMs,
+            downstreamBytesPerSecond: null,
+            upstreamBytesPerSecond: null,
+            concurrentSentBytes: 0,
+            concurrentReceivedBytes: 0,
+            contended: false,
+            latencyUnderLoadMs: null,
+        };
+        if (!toolsocket.connected) {
+            result.status = 'failed';
+            result.reason = 'not-connected';
+            resolve(result);
+            return;
+        }
+        let done = false;
+        const finish = () => {
+            if (!done) {
+                done = true;
+                result.timestamp = Date.now();
+                resolve(result);
+            }
+        };
+        const timeout = setTimeout(() => {
+            result.status = 'failed';
+            result.reason = 'timeout-or-unsupported-client';
+            finish();
+        }, PROBE_TIMEOUT_MS);
+        if (timeout.unref) {
+            timeout.unref();
+        }
+
+        const raw = toolsocket.socket && toolsocket.socket._socket;
+        const counterStart = (raw && typeof raw.bytesRead === 'number')
+            ? {read: raw.bytesRead, written: raw.bytesWritten} : null;
+        const toRate = (bytes, elapsedMs) =>
+            Math.round(bytes / Math.max(elapsedMs - rttMs, 0.5) * 1000);
+
+        // Phase 1 - downstream: send a large incompressible payload, get a tiny ack
+        const downStart = now();
+        toolsocket.meta('probe/down', null, () => {
+            if (done) {
+                return;
+            }
+            result.downstreamBytesPerSecond = toRate(size, now() - downStart);
+
+            // Phase 2 - upstream: ask the peer for the same amount back
+            const upStart = now();
+            toolsocket.meta('probe/up', size, (_body, binaryData) => {
+                if (done) {
+                    return;
+                }
+                const received = (binaryData && binaryData.byteLength) || size;
+                result.upstreamBytesPerSecond = toRate(received, now() - upStart);
+                // Concurrent app traffic during the probe (approximate; envelope
+                // and frame overhead slightly overstate it)
+                if (counterStart && raw && typeof raw.bytesRead === 'number') {
+                    result.concurrentSentBytes = Math.max(0,
+                        raw.bytesWritten - counterStart.written - size);
+                    result.concurrentReceivedBytes = Math.max(0,
+                        raw.bytesRead - counterStart.read - received);
+                    result.contended = (result.concurrentSentBytes
+                        + result.concurrentReceivedBytes) > 0.1 * (size + received);
+                }
+                result.status = 'ok';
+                clearTimeout(timeout);
+                finish();
+            });
+        }, makeProbePayload(size));
+    });
+}
+
+ToolSocketInfo.runProbe = runProbe;
+ToolSocketInfo.DEFAULT_PROBE_SIZE_BYTES = DEFAULT_PROBE_SIZE_BYTES;
 
 module.exports = ToolSocketInfo;
