@@ -29,8 +29,35 @@
  *         sentBytes:             number — outgoing bytes since the last report
  *         receivedBytes:         number — incoming bytes since the last report
  *       }
+ *       networkQuality: { — plain-language interpretation of realtime connection quality
+ *         score:  number   — 0 (unusable) to 100 (perfect realtime behavior)
+ *         rating: string   — 'excellent' | 'good' | 'degraded' | 'poor'
+ *         flow:   string   — 'realtime' (data moves live) | 'buffered' (held by the
+ *                            network and pumped in bursts) | 'stalled' (nothing
+ *                            arriving) | 'ended' (connection closed; final report)
+ *         issues: string[] — self-explanatory flags, present only when detected:
+ *                            'data-arriving-in-bursts-not-realtime',
+ *                            'incoming-data-stalled', 'outgoing-data-queuing-locally',
+ *                            'high-latency', 'latency-unstable',
+ *                            'client-under-pressure', 'connection-cut-abnormally'
+ *         details: {       — the underlying low-level numbers, for experts
+ *           jitterMs, silentSeconds, longestSilenceSeconds, maxBufferedBytes,
+ *           connectionAgeSeconds, and on the final report closeCode + endedCleanly
+ *         }
+ *       }
  *     }
  *   }
+ *
+ * How network quality is derived: because a protocol ping goes out every second, a
+ * healthy realtime link ALWAYS has inbound bytes every second — so seconds with zero
+ * inbound bytes ('silent seconds') mean the path is not live: a few of them with data
+ * still arriving overall is the store-and-forward pattern of buffering middleboxes
+ * (flow 'buffered'); a streak of them is a stall. Outgoing pressure is read from the
+ * socket's bufferedAmount (data queued locally because the path isn't draining).
+ * Jitter is the spread (max - min) of the window's protocol ping round trips. On
+ * close, the close code is captured and a final report is pushed: code 1000/1001 is
+ * a clean end, anything else (especially 1006) means the connection was cut, which
+ * is the typical signature of proxies and zero-trust gateways killing the socket.
  *
  * How latency is measured — two complementary signals:
  *
@@ -121,6 +148,19 @@ class ToolSocketInfo {
         this.windowBytesSent = 0;
         this.windowBytesReceived = 0;
         this.peakBytesPerSecond = 0;
+
+        // --- network quality state ---
+        this.connectionStartMs = 0;
+        // Seconds in this window with zero inbound bytes (not live if > 0)
+        this.silentSeconds = 0;
+        // Running streak of consecutive silent seconds (spans window boundaries)
+        this.currentSilenceStreak = 0;
+        this.longestSilenceSeconds = 0;
+        // Outgoing backpressure observed this window
+        this.maxBufferedBytes = 0;
+        this.bufferedTicks = 0;
+        /** @type {?{closeCode: ?number, endedCleanly: boolean}} set once on close */
+        this.closeInfo = null;
     }
 
     /**
@@ -167,6 +207,25 @@ class ToolSocketInfo {
         // --- network latency collection ------------------------------------
         this._ensureProtocolPingHooks();
 
+        // --- connection end capture -----------------------------------------
+        // A clean close is code 1000/1001; anything else (especially 1006, closed
+        // without a close frame) means the connection was cut, e.g. by a proxy
+        this._listen('close', (event) => {
+            if (this.closeInfo) {
+                return;
+            }
+            const code = (event && typeof event.code === 'number') ? event.code : null;
+            this.closeInfo = {
+                closeCode: code,
+                endedCleanly: code === 1000 || code === 1001,
+            };
+            this._report(); // push a final report for this connection immediately
+            clearInterval(this.tickInterval);
+            this.tickInterval = null;
+        });
+
+        this.connectionStartMs = Date.now();
+
         // --- transport collection: baseline the TCP counters ---------------
         this._sampleSocketCounters(); // establishes the baseline, returns zero deltas
 
@@ -200,6 +259,13 @@ class ToolSocketInfo {
         this.lastAppLatencyMs = null;
         this.networkLatencySamples = [];
         this.lastNetworkLatencyMs = null;
+        this.connectionStartMs = 0;
+        this.silentSeconds = 0;
+        this.currentSilenceStreak = 0;
+        this.longestSilenceSeconds = 0;
+        this.maxBufferedBytes = 0;
+        this.bufferedTicks = 0;
+        this.closeInfo = null;
         this.countedSocket = null;
         this.lastBytesRead = 0;
         this.lastBytesWritten = 0;
@@ -215,13 +281,39 @@ class ToolSocketInfo {
      * Every BUCKETS_PER_REPORT ticks, pushes a report.
      */
     _tick() {
-        const {deltaRead, deltaWritten} = this._sampleSocketCounters();
+        const {deltaRead, deltaWritten, rebaselined} = this._sampleSocketCounters();
         const secondTotal = deltaRead + deltaWritten;
         if (secondTotal > this.peakBytesPerSecond) {
             this.peakBytesPerSecond = secondTotal;
         }
         this.windowBytesSent += deltaWritten;
         this.windowBytesReceived += deltaRead;
+
+        // Flow probing: our own 1 Hz protocol ping guarantees inbound bytes every
+        // second on a healthy realtime link, so a silent second means "not live"
+        if (!rebaselined && !this.closeInfo) {
+            if (deltaRead === 0) {
+                this.silentSeconds++;
+                this.currentSilenceStreak++;
+                if (this.currentSilenceStreak > this.longestSilenceSeconds) {
+                    this.longestSilenceSeconds = this.currentSilenceStreak;
+                }
+            } else {
+                this.currentSilenceStreak = 0;
+            }
+        }
+
+        // Outgoing backpressure: bytes stuck in the local send buffer because the
+        // network path is not draining them
+        const websocket = this.toolsocket.socket;
+        const buffered = (websocket && typeof websocket.bufferedAmount === 'number')
+            ? websocket.bufferedAmount : 0;
+        if (buffered > 0) {
+            this.bufferedTicks++;
+            if (buffered > this.maxBufferedBytes) {
+                this.maxBufferedBytes = buffered;
+            }
+        }
 
         // Network latency: one protocol-level ping per tick (re-hooking if the
         // underlying socket was replaced)
@@ -256,12 +348,18 @@ class ToolSocketInfo {
             receivedBytes: this.windowBytesReceived,
         };
 
+        const networkQuality = this._deriveNetworkQuality(networkLatency, appLatency);
+
         // Reset the collection window
         this.networkLatencySamples = [];
         this.appLatencySamples = [];
         this.windowBytesSent = 0;
         this.windowBytesReceived = 0;
         this.peakBytesPerSecond = 0;
+        this.silentSeconds = 0;
+        this.longestSilenceSeconds = 0;
+        this.maxBufferedBytes = 0;
+        this.bufferedTicks = 0;
         this.tickCount = 0;
         this.windowStartMs = Date.now();
 
@@ -275,6 +373,7 @@ class ToolSocketInfo {
                 networkLatency: networkLatency,
                 appLatency: appLatency,
                 transport: transport,
+                networkQuality: networkQuality,
             },
         });
     }
@@ -291,20 +390,20 @@ class ToolSocketInfo {
         if (!raw || typeof raw.bytesRead !== 'number') {
             // No usable underlying socket (e.g. not connected yet)
             this.countedSocket = null;
-            return {deltaRead: 0, deltaWritten: 0};
+            return {deltaRead: 0, deltaWritten: 0, rebaselined: true};
         }
         if (raw !== this.countedSocket) {
             // First sample, or the socket was replaced: establish a new baseline
             this.countedSocket = raw;
             this.lastBytesRead = raw.bytesRead;
             this.lastBytesWritten = raw.bytesWritten;
-            return {deltaRead: 0, deltaWritten: 0};
+            return {deltaRead: 0, deltaWritten: 0, rebaselined: true};
         }
         const deltaRead = raw.bytesRead - this.lastBytesRead;
         const deltaWritten = raw.bytesWritten - this.lastBytesWritten;
         this.lastBytesRead = raw.bytesRead;
         this.lastBytesWritten = raw.bytesWritten;
-        return {deltaRead, deltaWritten};
+        return {deltaRead, deltaWritten, rebaselined: false};
     }
 
     /**
@@ -365,6 +464,104 @@ class ToolSocketInfo {
         } catch (_e) {
             // socket raced into a closing state; skip this sample
         }
+    }
+
+    /**
+     * Turns this window's low-level signals into a plain-language quality summary
+     * that a non-expert can act on. See the module comment for the reasoning.
+     * @param {?Object} networkLatency - this window's protocol ping stats
+     * @param {?Object} appLatency - this window's ToolSocket ping stats
+     * @returns {Object}
+     */
+    _deriveNetworkQuality(networkLatency, appLatency) {
+        const issues = [];
+        let score = 100;
+
+        // Flow: is data actually moving in realtime?
+        let flow = 'realtime';
+        if (this.closeInfo) {
+            flow = 'ended';
+        } else if (this.longestSilenceSeconds >= 3) {
+            flow = 'stalled';
+            issues.push('incoming-data-stalled');
+        } else if (this.silentSeconds >= 1) {
+            flow = 'buffered';
+            issues.push('data-arriving-in-bursts-not-realtime');
+        }
+        score -= Math.min(this.silentSeconds * 15, 45);
+
+        // Latency magnitude and steadiness
+        let jitterMs = null;
+        if (networkLatency) {
+            jitterMs = Math.round((networkLatency.maxMs - networkLatency.minMs) * 10) / 10;
+            if (networkLatency.averageMs > 400) {
+                score -= 25;
+                issues.push('high-latency');
+            } else if (networkLatency.averageMs > 150) {
+                score -= 10;
+                issues.push('high-latency');
+            }
+            if (jitterMs > 100) {
+                score -= 25;
+                issues.push('latency-unstable');
+            } else if (jitterMs > 20 && jitterMs > networkLatency.averageMs * 2) {
+                score -= 10;
+                issues.push('latency-unstable');
+            }
+        }
+
+        // Outgoing backpressure
+        if (this.maxBufferedBytes > 1024 * 1024 || this.bufferedTicks >= 3) {
+            score -= 30;
+            issues.push('outgoing-data-queuing-locally');
+        } else if (this.bufferedTicks >= 1 && this.maxBufferedBytes > 16 * 1024) {
+            score -= 15;
+            issues.push('outgoing-data-queuing-locally');
+        }
+
+        // Client pressure: informational, does not count against the network score
+        if (networkLatency && appLatency
+            && appLatency.averageMs - networkLatency.averageMs > 100) {
+            issues.push('client-under-pressure');
+        }
+
+        if (this.closeInfo && !this.closeInfo.endedCleanly) {
+            // Being cut without a close handshake is the signature of proxies and
+            // zero-trust gateways killing the socket — a serious quality problem
+            score -= 40;
+            issues.push('connection-cut-abnormally');
+        }
+
+        score = Math.max(0, Math.min(100, score));
+        let rating;
+        if (score >= 90) {
+            rating = 'excellent';
+        } else if (score >= 70) {
+            rating = 'good';
+        } else if (score >= 40) {
+            rating = 'degraded';
+        } else {
+            rating = 'poor';
+        }
+
+        const quality = {
+            score: score,
+            rating: rating,
+            flow: flow,
+            issues: issues,
+            details: {
+                jitterMs: jitterMs,
+                silentSeconds: this.silentSeconds,
+                longestSilenceSeconds: this.longestSilenceSeconds,
+                maxBufferedBytes: this.maxBufferedBytes,
+                connectionAgeSeconds: Math.round((Date.now() - this.connectionStartMs) / 1000),
+            },
+        };
+        if (this.closeInfo) {
+            quality.details.closeCode = this.closeInfo.closeCode;
+            quality.details.endedCleanly = this.closeInfo.endedCleanly;
+        }
+        return quality;
     }
 
     /**
