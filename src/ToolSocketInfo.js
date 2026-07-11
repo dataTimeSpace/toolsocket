@@ -13,6 +13,8 @@
  *     type:      'info'
  *     timestamp: number  — Date.now() at the moment the report is pushed
  *     data: {
+ *       name: ?string      — the connection's name, if one was assigned via
+ *                            info(true, cb, {name: '...'}), e.g. a user name
  *       networkLatency: {  — round trips of WebSocket protocol-level ping/pong frames
  *         currentMs: number  — round trip time of the most recent ping/pong
  *         averageMs: number  — average over samples since the last report
@@ -49,6 +51,19 @@
  *                              path buffers under load, i.e. bufferbloat)
  *         reason:    string  — only when failed, e.g. 'not-connected',
  *                              'timeout-or-unsupported-client'
+ *       }
+ *       history: {        — issue accumulation over the whole info-active period
+ *                            (never reset per window; ends up in the final report)
+ *         since:           number — when info was enabled (tracking period start)
+ *         durationSeconds: number — how long info has been active
+ *         reports:         number — how many report windows were observed
+ *         issues: {        — per issue id seen at least once:
+ *           count:    number — report windows in which the issue appeared
+ *           episodes: number — distinct occurrences (consecutive windows with the
+ *                              same issue count as ONE episode), i.e. how OFTEN
+ *           firstAt:  number — timestamp of the first appearance
+ *           lastAt:   number — timestamp of the most recent appearance
+ *         }
  *       }
  *       networkQuality: { — plain-language interpretation of realtime connection quality
  *         score:  number   — 0 (unusable) to 100 (perfect realtime behavior)
@@ -256,6 +271,18 @@ class ToolSocketInfo {
         /** @type {number[]} recent overall scores, for the trend indicator */
         this.scoreHistory = [];
 
+        // --- connection identity ---
+        /** @type {?string} name assigned by the server, e.g. a user name */
+        this.connectionName = null;
+
+        // --- issue history: accumulates for the whole info-active period ---
+        this.historyStart = 0;
+        this.reportCount = 0;
+        /** @type {Object<string, {count: number, episodes: number, firstAt: number, lastAt: number}>} */
+        this.issueHistory = {};
+        /** @type {Set<string>} issues present in the previous report window */
+        this.previousIssues = new Set();
+
         // --- throughput probe state ---
         /** @type {?Object} latest probe result; persists until the next probe */
         this.probeResult = null;
@@ -275,6 +302,14 @@ class ToolSocketInfo {
      */
     setCallback(callback) {
         this.callback = typeof callback === 'function' ? callback : null;
+    }
+
+    /**
+     * Assigns (or replaces) this connection's name, included in every report
+     * @param {?string} name
+     */
+    setName(name) {
+        this.connectionName = (typeof name === 'string' && name.length > 0) ? name : null;
     }
 
     /**
@@ -331,6 +366,7 @@ class ToolSocketInfo {
         });
 
         this.connectionStartMs = Date.now();
+        this.historyStart = Date.now();
 
         // --- transport collection: baseline the TCP counters ---------------
         this._sampleSocketCounters(); // establishes the baseline, returns zero deltas
@@ -566,6 +602,34 @@ class ToolSocketInfo {
 
         const networkQuality = this._deriveNetworkQuality(networkLatency, appLatency);
 
+        // Accumulate the issue history: count = windows with the issue, episodes =
+        // distinct occurrences (issue absent in the previous window = new episode)
+        this.reportCount++;
+        const reportTime = Date.now();
+        const currentIssues = new Set(networkQuality.issues);
+        for (const id of currentIssues) {
+            let entry = this.issueHistory[id];
+            if (!entry) {
+                entry = {count: 0, episodes: 0, firstAt: reportTime, lastAt: reportTime};
+                this.issueHistory[id] = entry;
+            }
+            entry.count++;
+            if (!this.previousIssues.has(id)) {
+                entry.episodes++;
+            }
+            entry.lastAt = reportTime;
+        }
+        this.previousIssues = currentIssues;
+
+        const history = {
+            since: this.historyStart,
+            durationSeconds: Math.round((reportTime - this.historyStart) / 1000),
+            reports: this.reportCount,
+            // copied so report consumers cannot mutate the accumulator
+            issues: Object.fromEntries(Object.entries(this.issueHistory)
+                .map(([id, entry]) => [id, {...entry}])),
+        };
+
         // Reset the collection window
         this.networkLatencySamples = [];
         this.appLatencySamples = [];
@@ -587,11 +651,13 @@ class ToolSocketInfo {
             type: 'info',
             timestamp: Date.now(),
             data: {
+                name: this.connectionName,
                 networkLatency: networkLatency,
                 appLatency: appLatency,
                 transport: transport,
                 networkQuality: networkQuality,
                 probe: this.probeResult,
+                history: history,
             },
         });
     }

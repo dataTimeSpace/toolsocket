@@ -43,6 +43,9 @@ class IncomingToolSocket extends ToolSocket {
      *                                     e.g. when only triggering a probe.
      *                                     Report content is defined in ToolSocketInfo.js.
      * @param {?Object} [options] - Additional actions:
+     * @param {string} [options.name] - Assigns a name to this connection (e.g. the
+     *                                  user name the server identified it with);
+     *                                  included in every report as data.name
      * @param {boolean} [options.probe] - If true, runs a one-shot throughput probe
      *                                    (max upstream/downstream measurement). The
      *                                    result is included in every report's
@@ -62,6 +65,9 @@ class IncomingToolSocket extends ToolSocket {
                 this.infoHandler.setCallback(infoCallback);
             }
             this.infoHandler.start();
+            if (options && typeof options.name === 'string') {
+                this.infoHandler.setName(options.name);
+            }
             if (options && options.probe) {
                 this.infoHandler.startProbe(options.probeSizeBytes);
             }
