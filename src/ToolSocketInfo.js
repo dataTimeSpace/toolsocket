@@ -508,10 +508,18 @@ class ToolSocketInfo {
         }
 
         // Outgoing backpressure: bytes stuck in the local send buffer because the
-        // network path is not draining them
+        // network path is not draining them. NB-enhanced sockets deliberately keep
+        // the ws buffer below their low-water mark and hold real send pressure in
+        // the NB scheduler queue instead, so include that queue when present.
         const websocket = this.toolsocket.socket;
-        const buffered = (websocket && typeof websocket.bufferedAmount === 'number')
+        let buffered = (websocket && typeof websocket.bufferedAmount === 'number')
             ? websocket.bufferedAmount : 0;
+        if (typeof this.toolsocket.getBackpressure === 'function') {
+            const nbStats = this.toolsocket.getBackpressure();
+            if (nbStats && typeof nbStats.queuedBytes === 'number') {
+                buffered += nbStats.queuedBytes;
+            }
+        }
         if (buffered > 0) {
             this.bufferedTicks++;
             if (buffered > this.maxBufferedBytes) {
