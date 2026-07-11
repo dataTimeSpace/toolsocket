@@ -1,8 +1,9 @@
 /**
  * ToolSocketInfo — live info reporting for a ToolSocket connection.
  *
- * This module is ONLY loaded when ToolSocket.info(true, callback) is called for the
- * first time. While info mode is off, none of this code is loaded or executed and the
+ * This module is ONLY loaded when IncomingToolSocket.info(true, callback) is called
+ * for the first time — the info API is server side only; client sockets do not expose
+ * it. While info mode is off, none of this code is loaded or executed and the
  * ToolSocket hot paths carry zero extra work: observation happens exclusively through
  * ToolSocket's event system, whose triggerEvent() early-returns with no listeners.
  *
@@ -26,8 +27,8 @@
  * (route 'action/ping') every ~5s with a response callback, which assigns it a message
  * id. We listen to the 'send' event to record the send time of each ping id, and to
  * the 'res' event to match the incoming response id back to it. The difference is the
- * application-level round trip time. This works on both outbound (client) sockets and
- * server-side IncomingToolSockets, since both run the same keepalive loop.
+ * application-level round trip time between the server and that connected client, as
+ * measured on the server-side IncomingToolSocket, which runs its own keepalive loop.
  */
 
 const REPORT_INTERVAL_MS = 5000;
