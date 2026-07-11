@@ -38,6 +38,15 @@
  *         rttMsAtProbe:            number — network RTT baseline subtracted from timings
  *         downstreamBytesPerSecond: ?number — measured server -> client rate
  *         upstreamBytesPerSecond:   ?number — measured client -> server rate
+ *         concurrentSentBytes:     number — approx. app traffic sent during the probe
+ *         concurrentReceivedBytes: number — approx. app traffic received during it
+ *         contended: boolean — true if significant app traffic shared the connection,
+ *                              meaning the rates are what the probe could grab while
+ *                              competing; probe rate + concurrent rate approximates
+ *                              the total capacity of the path
+ *         latencyUnderLoadMs: ?number — worst network RTT observed while the probe
+ *                              was transferring (rising far above idle RTT = the
+ *                              path buffers under load, i.e. bufferbloat)
  *         reason:    string  — only when failed, e.g. 'not-connected',
  *                              'timeout-or-unsupported-client'
  *       }
@@ -84,9 +93,19 @@
  * response, so the elapsed time minus the RTT baseline is the payload's transfer
  * time. Upstream: meta route 'probe/up' asks the client to respond with the same
  * amount of incompressible data. Both responders are built into ToolSocket's default
- * meta routes and are completely passive until a probe request arrives. Probe traffic
- * is real traffic: it will appear in that window's transport numbers, and protocol
- * pings sent during the transfer measure latency under load.
+ * meta routes and are completely passive until a probe request arrives.
+ *
+ * The probe is IN-BAND: it shares the one TCP stream with live application traffic,
+ * competing with it (and briefly delaying it — a probe frame head-of-line-blocks
+ * messages queued behind it). This is deliberate: it measures the capacity available
+ * to THIS connection through THIS network path. To keep the numbers honest, the app
+ * traffic that flowed during the probe is reported alongside (concurrent* fields) and
+ * 'contended' flags results that competed with significant traffic. Report windows
+ * overlapping a probe are marked (details.probeTrafficInWindow), their delivery
+ * dimension is withheld (the probe itself causes send-buffer pressure), and their
+ * score is excluded from the trend history, so a probe never triggers false alarms
+ * about the network. Latency and stability remain as measured — RTT under probe load
+ * is genuine information about how the path behaves when saturated.
  *
  * Scoring: each dimension maps to 0-100 through the piecewise-linear anchor tables
  * below (continuity is simply the fraction of seconds with inbound data). The overall
@@ -243,6 +262,11 @@ class ToolSocketInfo {
         this.probeRunning = false;
         /** @type {?ReturnType<setTimeout>} */
         this.probeTimeout = null;
+        // True if a probe transferred during the current report window
+        this.probeActiveInWindow = false;
+        // TCP counter snapshot at probe start, for measuring concurrent app traffic
+        /** @type {?{read: number, written: number}} */
+        this.probeCounterStart = null;
     }
 
     /**
@@ -384,7 +408,11 @@ class ToolSocketInfo {
         }
 
         this.probeRunning = true;
+        this.probeActiveInWindow = true;
         const rttMs = this.lastNetworkLatencyMs || 0;
+        const raw = this.toolsocket.socket && this.toolsocket.socket._socket;
+        this.probeCounterStart = (raw && typeof raw.bytesRead === 'number')
+            ? {read: raw.bytesRead, written: raw.bytesWritten} : null;
         this.probeResult = {
             status: 'running',
             timestamp: Date.now(),
@@ -392,6 +420,10 @@ class ToolSocketInfo {
             rttMsAtProbe: rttMs,
             downstreamBytesPerSecond: null,
             upstreamBytesPerSecond: null,
+            concurrentSentBytes: 0,
+            concurrentReceivedBytes: 0,
+            contended: false,
+            latencyUnderLoadMs: null,
         };
         // bytes / (elapsed minus the RTT baseline) = transfer rate of the payload
         const toRate = (bytes, elapsedMs) =>
@@ -426,6 +458,19 @@ class ToolSocketInfo {
                 }
                 const received = (binaryData && binaryData.byteLength) || size;
                 this.probeResult.upstreamBytesPerSecond = toRate(received, now() - upStart);
+                // Concurrent app traffic: total wire bytes during the probe minus
+                // the probe's own payloads (envelope/frame overhead makes this an
+                // approximation, slightly overstating concurrent traffic)
+                if (this.probeCounterStart && raw && typeof raw.bytesRead === 'number') {
+                    this.probeResult.concurrentSentBytes = Math.max(0,
+                        raw.bytesWritten - this.probeCounterStart.written - size);
+                    this.probeResult.concurrentReceivedBytes = Math.max(0,
+                        raw.bytesRead - this.probeCounterStart.read - received);
+                    this.probeResult.contended =
+                        (this.probeResult.concurrentSentBytes
+                            + this.probeResult.concurrentReceivedBytes) > 0.1 * (size + received);
+                }
+                this.probeCounterStart = null;
                 this.probeResult.status = 'ok';
                 this.probeResult.timestamp = Date.now();
                 this.probeRunning = false;
@@ -474,6 +519,10 @@ class ToolSocketInfo {
             }
         }
 
+        if (this.probeRunning) {
+            this.probeActiveInWindow = true;
+        }
+
         // Network latency: one protocol-level ping per tick (re-hooking if the
         // underlying socket was replaced)
         this._ensureProtocolPingHooks();
@@ -519,6 +568,7 @@ class ToolSocketInfo {
         this.longestSilenceSeconds = 0;
         this.maxBufferedBytes = 0;
         this.bufferedTicks = 0;
+        this.probeActiveInWindow = false;
         this.tickCount = 0;
         this.windowStartMs = Date.now();
 
@@ -593,6 +643,11 @@ class ToolSocketInfo {
             const roundTripMs = Math.round((now() - sentAt) * 10) / 10;
             this.lastNetworkLatencyMs = roundTripMs;
             this.networkLatencySamples.push(roundTripMs);
+            if (this.probeRunning && this.probeResult
+                && (this.probeResult.latencyUnderLoadMs === null
+                    || roundTripMs > this.probeResult.latencyUnderLoadMs)) {
+                this.probeResult.latencyUnderLoadMs = roundTripMs;
+            }
         };
         websocket.on('pong', this.pongHandler);
         this.pingedSocket = websocket;
@@ -672,12 +727,17 @@ class ToolSocketInfo {
 
         // --- delivery: is our outbound data draining, or queuing locally?
         // Score from the worst queue depth seen, reduced further the more of the
-        // window the queue existed for (persistent backpressure is worse than a blip)
-        const persistencePenalty = Math.round(30 * this.bufferedTicks / measuredSeconds);
-        const delivery = Math.max(0,
-            interpolateScore(BUFFERED_SCORE_ANCHORS, this.maxBufferedBytes) - persistencePenalty);
-        if (this.bufferedTicks >= 1 && (this.maxBufferedBytes > 16 * 1024 || this.bufferedTicks >= 3)) {
-            issues.push('outgoing-data-queuing-locally');
+        // window the queue existed for (persistent backpressure is worse than a blip).
+        // Withheld entirely for windows in which a probe transferred: the probe's own
+        // burst causes send-buffer pressure, and we must not raise alarms about it.
+        let delivery = null;
+        if (!this.probeActiveInWindow) {
+            const persistencePenalty = Math.round(30 * this.bufferedTicks / measuredSeconds);
+            delivery = Math.max(0,
+                interpolateScore(BUFFERED_SCORE_ANCHORS, this.maxBufferedBytes) - persistencePenalty);
+            if (this.bufferedTicks >= 1 && (this.maxBufferedBytes > 16 * 1024 || this.bufferedTicks >= 3)) {
+                issues.push('outgoing-data-queuing-locally');
+            }
         }
 
         // Client pressure: informational, not a network dimension
@@ -719,7 +779,8 @@ class ToolSocketInfo {
             rating = 'poor';
         }
 
-        // --- trend: compare against the recent scores
+        // --- trend: compare against the recent scores. Windows with probe traffic
+        // are compared but never recorded, so self-inflicted load can't shape the trend
         let trend = 'stable';
         if (this.scoreHistory.length > 0) {
             const previousAverage = this.scoreHistory.reduce((a, b) => a + b, 0)
@@ -730,9 +791,11 @@ class ToolSocketInfo {
                 trend = 'degrading';
             }
         }
-        this.scoreHistory.push(score);
-        if (this.scoreHistory.length > TREND_HISTORY_LENGTH) {
-            this.scoreHistory.shift();
+        if (!this.probeActiveInWindow) {
+            this.scoreHistory.push(score);
+            if (this.scoreHistory.length > TREND_HISTORY_LENGTH) {
+                this.scoreHistory.shift();
+            }
         }
 
         const quality = {
@@ -753,6 +816,7 @@ class ToolSocketInfo {
                 longestSilenceSeconds: this.longestSilenceSeconds,
                 maxBufferedBytes: this.maxBufferedBytes,
                 connectionAgeSeconds: Math.round((Date.now() - this.connectionStartMs) / 1000),
+                probeTrafficInWindow: this.probeActiveInWindow,
             },
         };
         if (this.closeInfo) {
