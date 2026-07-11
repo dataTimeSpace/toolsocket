@@ -27,6 +27,12 @@ class ToolSocket {
 
         this.eventCallbacks = {}; // For events
         this.responseCallbacks = {}; // For handling direct responses to sent messages
+
+        // Client-side remote info subscription state (see info())
+        /** @type {?function} */
+        this.remoteInfoCallback = null;
+        this.remoteInfoSubscribed = false;
+        this.remoteInfoReattachArmed = false;
         /** @type {?BinaryBuffer} */
         this.binaryBuffer = null;
 
@@ -693,8 +699,9 @@ class ToolSocket {
      * per-connection info API.)
      * @param {boolean} [enabled=false] - Start (true) or stop (false) the stream
      * @param {?function} [infoCallback] - Receives {type: 'serverInfo', timestamp,
-     *     connections, reports: [per-connection info report objects], stagedProbe}.
-     *     Omit (undefined) to keep the current callback.
+     *     connections, reports: [per-connection info report objects], recentlyClosed:
+     *     [final reports of recently closed connections], stagedProbe}. Omit
+     *     (undefined) to keep the current callback.
      * @param {?Object} [options]
      * @param {boolean} [options.probe] - Ask the server to run a staged throughput
      *     probe across all its connections (results appear in stagedProbe)

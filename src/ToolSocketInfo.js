@@ -98,9 +98,10 @@
  * (flow 'buffered'); a streak of them is a stall. Outgoing pressure is read from the
  * socket's bufferedAmount (data queued locally because the path isn't draining).
  * Jitter is the spread (max - min) of the window's protocol ping round trips. On
- * close, the close code is captured and a final report is pushed: code 1000/1001 is
- * a clean end, anything else (especially 1006) means the connection was cut, which
- * is the typical signature of proxies and zero-trust gateways killing the socket.
+ * close, the close code is captured and a final report is pushed: codes 1000/1001
+ * (and 1005, a close frame without a status code) are a clean end; anything else,
+ * especially 1006 (no close frame at all), means the connection was cut - the
+ * typical signature of proxies and zero-trust gateways killing the socket.
  *
  * Throughput probe: an on-demand (never automatic) measurement of the maximum data
  * rate each direction sustains. Downstream: a payload of incompressible bytes is sent
@@ -159,6 +160,8 @@
  * replaced, the sampler re-baselines automatically and that second reads as zero.
  */
 
+const { makeProbePayload } = require('./utilities.js');
+
 const BUCKET_INTERVAL_MS = 1000;
 const BUCKETS_PER_REPORT = 5; // push a report to the callback every 5 seconds
 // Drop pending pings that never got a response (e.g. connection dropped mid-flight)
@@ -168,8 +171,6 @@ const PROTOCOL_PING_PREFIX = 'tsinfo:';
 // Throughput probe defaults: payload per direction and overall timeout
 const DEFAULT_PROBE_SIZE_BYTES = 256 * 1024;
 const PROBE_TIMEOUT_MS = 10000;
-
-const { makeProbePayload } = require('./utilities.js');
 
 // Piecewise-linear anchor tables: [measurement, score] pairs mapping a raw value to
 // a 0-100 dimension score. Values between anchors are linearly interpolated.
@@ -358,7 +359,9 @@ class ToolSocketInfo {
             const code = (event && typeof event.code === 'number') ? event.code : null;
             this.closeInfo = {
                 closeCode: code,
-                endedCleanly: code === 1000 || code === 1001,
+                // 1000 normal, 1001 going away, 1005 close frame without a status
+                // code (e.g. a plain client.close()) - all orderly close handshakes
+                endedCleanly: code === 1000 || code === 1001 || code === 1005,
             };
             this._report(); // push a final report for this connection immediately
             clearInterval(this.tickInterval);
@@ -600,7 +603,7 @@ class ToolSocketInfo {
                 appLatency: appLatency,
                 transport: transport,
                 networkQuality: networkQuality,
-                probe: this.probeResult,
+                probe: this.probeResult ? {...this.probeResult} : null,
                 history: history,
             },
         };

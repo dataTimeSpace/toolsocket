@@ -3,6 +3,9 @@ const { URL_SCHEMA, MESSAGE_BUNDLE_SCHEMA } = require('./schemas.js');
 const IncomingToolSocket = require('./IncomingToolSocket');
 const {generateUniqueId} = require("./utilities");
 
+// How many final reports of closed connections are kept for info subscribers
+const MAX_CLOSED_INFO_REPORTS = 25;
+
 /**
  * A server for ToolSocket
  */
@@ -35,6 +38,8 @@ class ToolSocketServer {
         this.infoBroadcastInterval = null;
         /** @type {Set<IncomingToolSocket>} connections whose info THIS feature enabled */
         this.infoAutoEnabled = new Set();
+        /** @type {Object[]} final info reports of recently closed connections */
+        this.infoClosedReports = [];
 
         this.server.on('listening', (...args) => {
             this.triggerEvent('listening', ...args);
@@ -56,6 +61,15 @@ class ToolSocketServer {
             socket.on('close', () => {
                 this.sockets.splice(this.sockets.indexOf(toolSocket), 1);
                 this.infoAutoEnabled.delete(toolSocket);
+                // Keep the connection's final report (its info handler pushes it on
+                // 'close' before this listener runs) for remote info subscribers -
+                // closed connections are the main evidence of network-level cuts
+                if (toolSocket.infoHandler && toolSocket.infoHandler.latestReport) {
+                    this.infoClosedReports.push(toolSocket.infoHandler.latestReport);
+                    if (this.infoClosedReports.length > MAX_CLOSED_INFO_REPORTS) {
+                        this.infoClosedReports.shift();
+                    }
+                }
                 // A closing subscriber ends its own subscription
                 if (this.infoSubscribers.has(toolSocket)) {
                     this.unsubscribeServerInfo(toolSocket);
@@ -163,6 +177,12 @@ class ToolSocketServer {
     }
 
     close() {
+        if (this.infoBroadcastInterval) {
+            clearInterval(this.infoBroadcastInterval);
+            this.infoBroadcastInterval = null;
+        }
+        this.infoSubscribers.clear();
+        this.infoAutoEnabled.clear();
         this.server.close();
     }
 
@@ -228,6 +248,7 @@ class ToolSocketServer {
             timestamp: Date.now(),
             connections: this.sockets.length,
             reports: reports,
+            recentlyClosed: this.infoClosedReports.slice(),
             stagedProbe: this.lastStagedProbeResult,
         };
         for (const subscriber of this.infoSubscribers) {
@@ -350,7 +371,7 @@ class ToolSocketServer {
             const downstreamRatio = ratio(individualTotalDown, allStage.totalDownstreamBytesPerSecond);
             const upstreamRatio = ratio(individualTotalUp, allStage.totalUpstreamBytesPerSecond);
 
-            const result = {
+            return {
                 status: 'ok',
                 startedAt: startedAt,
                 finishedAt: Date.now(),
@@ -373,13 +394,21 @@ class ToolSocketServer {
                         || (upstreamRatio !== null && upstreamRatio > 1.5),
                 },
             };
+        };
+        run().then((result) => {
             this.lastStagedProbeResult = result;
             this.stagedProbeRunning = false;
-            callback(result);
-        };
-        run().catch(() => {
+            try {
+                callback(result);
+            } catch (error) {
+                console.warn('stagedProbe callback threw', error);
+            }
+        }, (error) => {
+            console.warn('stagedProbe failed', error);
             this.stagedProbeRunning = false;
-            callback({status: 'failed', reason: 'internal-error'});
+            try {
+                callback({status: 'failed', reason: 'internal-error'});
+            } catch (_e) { /* app callback error */ }
         });
     }
 }
