@@ -35,21 +35,18 @@
  *         flow:   string   — 'realtime' (data moves live) | 'buffered' (held by the
  *                            network and pumped in bursts) | 'stalled' (nothing
  *                            arriving) | 'ended' (connection closed; final report)
- *         summary: string  — one plain sentence describing the current situation
- *         issues: [{       — present only when detected; each issue explains itself:
- *           id:              stable identifier, e.g. 'incoming-data-stalled',
+ *         trend:  string   — 'improving' | 'stable' | 'degrading' vs recent reports
+ *         scores: {        — per-dimension indicators, each 0-100 (null = no data):
+ *           continuity:      is data arriving every second (the realtime dimension)
+ *           latency:         is the round trip fast enough for realtime use
+ *           stability:       is the round trip consistent (jitter)
+ *           delivery:        is outbound data draining (send backpressure)
+ *         }
+ *         issues: string[] — flags, present only when detected:
  *                            'data-arriving-in-bursts-not-realtime',
- *                            'outgoing-data-queuing-locally', 'high-latency',
- *                            'latency-unstable', 'client-under-pressure',
- *                            'connection-cut-abnormally'
- *           severity:        'critical' | 'warning' | 'info'
- *           whatIsHappening: plain-language description with measured values
- *           likelyCause:     plain-language explanation of the probable cause
- *           tellYourIT:      a ready-to-forward message for the IT department,
- *                            containing the technical vocabulary and measurements
- *                            an expert needs to act (or a note when it is NOT a
- *                            network problem, so IT isn't sent chasing ghosts)
- *         }]
+ *                            'incoming-data-stalled', 'outgoing-data-queuing-locally',
+ *                            'high-latency', 'latency-unstable',
+ *                            'client-under-pressure', 'connection-cut-abnormally'
  *         details: {       — the underlying low-level numbers, for experts
  *           jitterMs, silentSeconds, longestSilenceSeconds, maxBufferedBytes,
  *           connectionAgeSeconds, and on the final report closeCode + endedCleanly
@@ -68,6 +65,13 @@
  * close, the close code is captured and a final report is pushed: code 1000/1001 is
  * a clean end, anything else (especially 1006) means the connection was cut, which
  * is the typical signature of proxies and zero-trust gateways killing the socket.
+ *
+ * Scoring: each dimension maps to 0-100 through the piecewise-linear anchor tables
+ * below (continuity is simply the fraction of seconds with inbound data). The overall
+ * score is 50% the worst dimension + 50% a weighted average with continuity weighted
+ * highest — realtime systems fail on their weakest dimension, so one bad dimension
+ * must drag the overall down. An abnormal connection cut caps the final report's
+ * score at 30. 'trend' compares the score against the previous three reports.
  *
  * How latency is measured — two complementary signals:
  *
@@ -105,6 +109,38 @@ const BUCKETS_PER_REPORT = 5; // push a report to the callback every 5 seconds
 const PENDING_PING_TIMEOUT_MS = 30000;
 // Marks our protocol-level PING payloads so we only interpret our own PONGs
 const PROTOCOL_PING_PREFIX = 'tsinfo:';
+
+// Piecewise-linear anchor tables: [measurement, score] pairs mapping a raw value to
+// a 0-100 dimension score. Values between anchors are linearly interpolated.
+// Average round trip in ms -> latency score
+const LATENCY_SCORE_ANCHORS = [[0, 100], [50, 95], [150, 80], [300, 55], [600, 30], [1200, 10], [2000, 0]];
+// Round trip spread (max - min) in ms -> stability score
+const JITTER_SCORE_ANCHORS = [[0, 100], [10, 95], [30, 85], [75, 65], [150, 40], [400, 15], [1000, 0]];
+// Peak bytes stuck in the local send buffer -> delivery score (before persistence penalty)
+const BUFFERED_SCORE_ANCHORS = [[0, 100], [16384, 85], [131072, 60], [1048576, 30], [8388608, 0]];
+// How many recent scores 'trend' compares against, and the change it must exceed
+const TREND_HISTORY_LENGTH = 3;
+const TREND_THRESHOLD = 8;
+
+/**
+ * Maps a measurement to a 0-100 score by linear interpolation over an anchor table
+ * @param {number[][]} anchors - [value, score] pairs, ascending by value
+ * @param {number} value
+ * @returns {number}
+ */
+function interpolateScore(anchors, value) {
+    if (value <= anchors[0][0]) {
+        return anchors[0][1];
+    }
+    for (let i = 1; i < anchors.length; i++) {
+        if (value <= anchors[i][0]) {
+            const [x0, y0] = anchors[i - 1];
+            const [x1, y1] = anchors[i];
+            return Math.round(y0 + (y1 - y0) * ((value - x0) / (x1 - x0)));
+        }
+    }
+    return anchors[anchors.length - 1][1];
+}
 
 const now = (typeof performance !== 'undefined' && performance.now)
     ? () => performance.now()
@@ -171,6 +207,8 @@ class ToolSocketInfo {
         this.bufferedTicks = 0;
         /** @type {?{closeCode: ?number, endedCleanly: boolean}} set once on close */
         this.closeInfo = null;
+        /** @type {number[]} recent overall scores, for the trend indicator */
+        this.scoreHistory = [];
     }
 
     /**
@@ -485,100 +523,79 @@ class ToolSocketInfo {
      */
     _deriveNetworkQuality(networkLatency, appLatency) {
         const issues = [];
-        let score = 100;
-        const connectionAgeSeconds = Math.round((Date.now() - this.connectionStartMs) / 1000);
+        const measuredSeconds = Math.max(this.tickCount, 1);
 
-        // Flow: is data actually moving in realtime?
+        // --- continuity: the realtime dimension. Our own 1 Hz protocol ping
+        // guarantees inbound bytes every second on a live path, so continuity is
+        // simply the fraction of measured seconds that actually carried data.
+        const liveSeconds = Math.max(measuredSeconds - this.silentSeconds, 0);
+        const continuity = Math.round(100 * liveSeconds / measuredSeconds);
+
         let flow = 'realtime';
         if (this.closeInfo) {
             flow = 'ended';
         } else if (this.longestSilenceSeconds >= 3) {
             flow = 'stalled';
-            issues.push({
-                id: 'incoming-data-stalled',
-                severity: 'critical',
-                whatIsHappening: `No data has arrived from the other side for ${this.longestSilenceSeconds} seconds in a row, even though the connection looks open.`,
-                likelyCause: 'The connection is probably silently blocked or dropped: a firewall, proxy or VPN cut it off without telling either side.',
-                tellYourIT: `Our WebSocket connection stopped receiving any data for ${this.longestSilenceSeconds}s while remaining in the OPEN state. Please check firewalls, proxies and zero-trust gateways on the path for idle timeouts or connection-tracking limits affecting long-lived WebSocket (wss) connections to this server.`,
-            });
+            issues.push('incoming-data-stalled');
         } else if (this.silentSeconds >= 1) {
             flow = 'buffered';
-            issues.push({
-                id: 'data-arriving-in-bursts-not-realtime',
-                severity: 'warning',
-                whatIsHappening: `Data is not flowing continuously: in ${this.silentSeconds} of the last ${BUCKETS_PER_REPORT} seconds nothing arrived, and then data came in bursts.`,
-                likelyCause: 'A device on the network path (proxy, VPN or security gateway) is holding data back and forwarding it in chunks instead of streaming it live.',
-                tellYourIT: `WebSocket frames to this server are being buffered on the network path: ${this.silentSeconds} of ${BUCKETS_PER_REPORT} seconds had zero inbound bytes, with traffic arriving in bursts afterwards. This is typical of TLS inspection or content scanning that does not stream WebSocket traffic. Please exempt this host from response buffering / inspection, or enable WebSocket streaming support on the gateway.`,
-            });
+            issues.push('data-arriving-in-bursts-not-realtime');
         }
-        score -= Math.min(this.silentSeconds * 15, 45);
 
-        // Latency magnitude and steadiness
+        // --- latency and stability, from this window's protocol ping round trips
         let jitterMs = null;
+        let latencyScore = null;
+        let stabilityScore = null;
         if (networkLatency) {
             jitterMs = Math.round((networkLatency.maxMs - networkLatency.minMs) * 10) / 10;
+            latencyScore = interpolateScore(LATENCY_SCORE_ANCHORS, networkLatency.averageMs);
+            stabilityScore = interpolateScore(JITTER_SCORE_ANCHORS, jitterMs);
             if (networkLatency.averageMs > 150) {
-                score -= (networkLatency.averageMs > 400) ? 25 : 10;
-                issues.push({
-                    id: 'high-latency',
-                    severity: 'warning',
-                    whatIsHappening: `Round trips to the other side take ${networkLatency.averageMs}ms on average, which is slow for realtime use.`,
-                    likelyCause: 'Traffic may be routed through a distant gateway (common with VPNs and cloud security services), or the network path is overloaded.',
-                    tellYourIT: `WebSocket round trip time to this client averages ${networkLatency.averageMs}ms (worst ${networkLatency.maxMs}ms). Please check whether this traffic is routed through a remote VPN or cloud security POP and whether a more direct route (e.g. split tunneling for this host) is possible.`,
-                });
+                issues.push('high-latency');
             }
             if (jitterMs > 100 || (jitterMs > 20 && jitterMs > networkLatency.averageMs * 2)) {
-                score -= (jitterMs > 100) ? 25 : 10;
-                issues.push({
-                    id: 'latency-unstable',
-                    severity: 'warning',
-                    whatIsHappening: `Response times are swinging between ${networkLatency.minMs}ms and ${networkLatency.maxMs}ms, which makes realtime interaction feel jerky.`,
-                    likelyCause: 'Network congestion, or a device that queues traffic and releases it unevenly.',
-                    tellYourIT: `WebSocket round trip jitter is ${jitterMs}ms (RTT ranges ${networkLatency.minMs}-${networkLatency.maxMs}ms within 5 seconds). Please check for congestion, traffic shaping or QoS queuing on the path to this server.`,
-                });
+                issues.push('latency-unstable');
             }
         }
 
-        // Outgoing backpressure
+        // --- delivery: is our outbound data draining, or queuing locally?
+        // Score from the worst queue depth seen, reduced further the more of the
+        // window the queue existed for (persistent backpressure is worse than a blip)
+        const persistencePenalty = Math.round(30 * this.bufferedTicks / measuredSeconds);
+        const delivery = Math.max(0,
+            interpolateScore(BUFFERED_SCORE_ANCHORS, this.maxBufferedBytes) - persistencePenalty);
         if (this.bufferedTicks >= 1 && (this.maxBufferedBytes > 16 * 1024 || this.bufferedTicks >= 3)) {
-            const severe = this.maxBufferedBytes > 1024 * 1024 || this.bufferedTicks >= 3;
-            score -= severe ? 30 : 15;
-            issues.push({
-                id: 'outgoing-data-queuing-locally',
-                severity: severe ? 'critical' : 'warning',
-                whatIsHappening: `Data we are sending is piling up locally (up to ${Math.round(this.maxBufferedBytes / 1024)} KB waiting) because the network is not accepting it fast enough.`,
-                likelyCause: 'The upload path towards the client is too slow or being throttled, or a device in between is not draining the stream.',
-                tellYourIT: `Outbound WebSocket data to this client is backing up in the local send buffer (peak ${this.maxBufferedBytes} bytes queued). Please check available bandwidth, rate limiting and traffic shaping between this server and the client.`,
-            });
+            issues.push('outgoing-data-queuing-locally');
         }
 
-        // Client pressure: informational, does not count against the network score
+        // Client pressure: informational, not a network dimension
         if (networkLatency && appLatency
             && appLatency.averageMs - networkLatency.averageMs > 100) {
-            const diff = Math.round(appLatency.averageMs - networkLatency.averageMs);
-            issues.push({
-                id: 'client-under-pressure',
-                severity: 'info',
-                whatIsHappening: `The client application answers ${diff}ms slower than the network itself, so the client device is busy or overloaded.`,
-                likelyCause: 'The client device, app or browser tab is under heavy load. The network itself is fine.',
-                tellYourIT: `This one is NOT a network problem: network round trip is ${networkLatency.averageMs}ms but the application-level round trip is ${appLatency.averageMs}ms. The delay is inside the client device or application - check its CPU load or what else it is running.`,
-            });
+            issues.push('client-under-pressure');
         }
+
+        // --- overall: 50% the worst dimension + 50% a weighted average, so a single
+        // failing dimension drags the overall down the way it drags realtime down
+        const weighted = [
+            [continuity, 0.4],
+            [latencyScore, 0.25],
+            [stabilityScore, 0.2],
+            [delivery, 0.15],
+        ].filter(([value]) => value !== null);
+        const weightSum = weighted.reduce((sum, [, weight]) => sum + weight, 0);
+        const weightedAverage = weighted.reduce(
+            (sum, [value, weight]) => sum + value * weight, 0) / weightSum;
+        const worst = Math.min(...weighted.map(([value]) => value));
+        let score = Math.round(0.5 * worst + 0.5 * weightedAverage);
 
         if (this.closeInfo && !this.closeInfo.endedCleanly) {
-            // Being cut without a close handshake is the signature of proxies and
-            // zero-trust gateways killing the socket — a serious quality problem
-            score -= 40;
-            issues.push({
-                id: 'connection-cut-abnormally',
-                severity: 'critical',
-                whatIsHappening: `The connection was terminated without a proper close handshake after ${connectionAgeSeconds} seconds.`,
-                likelyCause: 'A proxy, firewall or security gateway most likely killed the connection, typically due to an idle timeout or a maximum connection lifetime.',
-                tellYourIT: `The WebSocket to this client closed abnormally (close code ${this.closeInfo.closeCode === null ? '1006/none' : this.closeInfo.closeCode}, no close frame) after ${connectionAgeSeconds}s. If this repeats at similar connection ages, a proxy or zero-trust gateway is enforcing a connection lifetime or idle timeout - please allowlist long-lived wss connections to this server or extend the timeout.`,
-            });
+            // Cut without a close handshake: the signature of proxies and zero-trust
+            // gateways killing the socket. Cap the final report's score accordingly.
+            score = Math.min(score, 30);
+            issues.push('connection-cut-abnormally');
         }
-
         score = Math.max(0, Math.min(100, score));
+
         let rating;
         if (score >= 90) {
             rating = 'excellent';
@@ -590,34 +607,40 @@ class ToolSocketInfo {
             rating = 'poor';
         }
 
-        // One-sentence summary a non-expert can read out loud
-        let summary;
-        if (this.closeInfo) {
-            summary = this.closeInfo.endedCleanly
-                ? 'The connection ended normally.'
-                : 'The connection was cut off by the network without warning - see issues for what to tell your IT department.';
-        } else if (flow === 'stalled') {
-            summary = 'Realtime communication is interrupted: nothing is arriving anymore.';
-        } else if (flow === 'buffered') {
-            summary = 'Realtime communication is degraded: the network delivers data in bursts instead of live.';
-        } else if (issues.length > 0) {
-            summary = 'Realtime communication works, but with reduced quality - see issues.';
-        } else {
-            summary = 'Realtime communication is working normally.';
+        // --- trend: compare against the recent scores
+        let trend = 'stable';
+        if (this.scoreHistory.length > 0) {
+            const previousAverage = this.scoreHistory.reduce((a, b) => a + b, 0)
+                / this.scoreHistory.length;
+            if (score >= previousAverage + TREND_THRESHOLD) {
+                trend = 'improving';
+            } else if (score <= previousAverage - TREND_THRESHOLD) {
+                trend = 'degrading';
+            }
+        }
+        this.scoreHistory.push(score);
+        if (this.scoreHistory.length > TREND_HISTORY_LENGTH) {
+            this.scoreHistory.shift();
         }
 
         const quality = {
             score: score,
             rating: rating,
             flow: flow,
-            summary: summary,
+            trend: trend,
+            scores: {
+                continuity: continuity,
+                latency: latencyScore,
+                stability: stabilityScore,
+                delivery: delivery,
+            },
             issues: issues,
             details: {
                 jitterMs: jitterMs,
                 silentSeconds: this.silentSeconds,
                 longestSilenceSeconds: this.longestSilenceSeconds,
                 maxBufferedBytes: this.maxBufferedBytes,
-                connectionAgeSeconds: connectionAgeSeconds,
+                connectionAgeSeconds: Math.round((Date.now() - this.connectionStartMs) / 1000),
             },
         };
         if (this.closeInfo) {
