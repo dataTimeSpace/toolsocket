@@ -192,6 +192,32 @@ class ToolSocket {
                 if (response) {
                     response.send('ok', makeProbePayload(body));
                 }
+            } else if (route === 'info/report') {
+                // A server-info bundle pushed by the other side for a subscription
+                // created via the client-side info(true, callback) API
+                if (this.remoteInfoCallback) {
+                    this.remoteInfoCallback(body);
+                }
+            } else if (route === 'info/subscribe') {
+                // Only meaningful on server-side sockets (this.server is set there)
+                if (this.server && this.server.subscribeServerInfo) {
+                    this.server.subscribeServerInfo(this);
+                }
+            } else if (route === 'info/unsubscribe') {
+                if (this.server && this.server.unsubscribeServerInfo) {
+                    this.server.unsubscribeServerInfo(this);
+                }
+            } else if (route === 'info/probe') {
+                // Client-requested staged throughput probe across all connections;
+                // the result is sent back as the response and also appears in the
+                // stagedProbe field of subsequent info/report bundles
+                if (this.server && this.server.stagedProbe) {
+                    this.server.stagedProbe((result) => {
+                        if (response) {
+                            response.send(result);
+                        }
+                    }, body || {});
+                }
             } else {
                 console.warn(`Received unknown meta route: "${route}"`);
             }
@@ -653,6 +679,54 @@ class ToolSocket {
      */
     meta(route, body, callback, binaryData) {
         this.sendMethod('meta', route, body, callback, binaryData);
+    }
+
+    /**
+     * Client-side info API: asks the connected server to stream its info reports for
+     * ALL of its connections to this client via the given callback, every 5 seconds,
+     * until info(false) is called or this connection closes. Rides on ToolSocket's
+     * meta transport (routes info/subscribe, info/unsubscribe, info/report,
+     * info/probe) — the server only responds if it supports the info API. The
+     * subscription automatically re-arms after a reconnect. Note: there is no
+     * built-in authorization; gate access at the application level if needed.
+     * (On server-side IncomingToolSockets this method is overridden by the local
+     * per-connection info API.)
+     * @param {boolean} [enabled=false] - Start (true) or stop (false) the stream
+     * @param {?function} [infoCallback] - Receives {type: 'serverInfo', timestamp,
+     *     connections, reports: [per-connection info report objects], stagedProbe}.
+     *     Omit (undefined) to keep the current callback.
+     * @param {?Object} [options]
+     * @param {boolean} [options.probe] - Ask the server to run a staged throughput
+     *     probe across all its connections (results appear in stagedProbe)
+     * @param {number} [options.probeSizeBytes] - Payload per direction per probe
+     */
+    info(enabled = false, infoCallback, options) {
+        if (enabled) {
+            if (infoCallback !== undefined) {
+                this.remoteInfoCallback = infoCallback || null;
+            }
+            if (!this.remoteInfoSubscribed) {
+                this.remoteInfoSubscribed = true;
+                this.meta('info/subscribe', null);
+                if (!this.remoteInfoReattachArmed) {
+                    // Re-subscribe automatically when the connection re-opens
+                    this.remoteInfoReattachArmed = true;
+                    this.addEventListener('open', () => {
+                        if (this.remoteInfoSubscribed) {
+                            this.meta('info/subscribe', null);
+                        }
+                    });
+                }
+            }
+            if (options && options.probe) {
+                this.meta('info/probe',
+                    options.probeSizeBytes ? {sizeBytes: options.probeSizeBytes} : null);
+            }
+        } else if (this.remoteInfoSubscribed) {
+            this.remoteInfoSubscribed = false;
+            this.remoteInfoCallback = null;
+            this.meta('info/unsubscribe', null);
+        }
     }
 
     /**

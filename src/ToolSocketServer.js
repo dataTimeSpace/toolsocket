@@ -28,6 +28,14 @@ class ToolSocketServer {
         /** @type {?Object} latest staged probe result */
         this.lastStagedProbeResult = null;
 
+        // Remote info subscriptions (see subscribeServerInfo())
+        /** @type {Set<IncomingToolSocket>} */
+        this.infoSubscribers = new Set();
+        /** @type {?ReturnType<setInterval>} */
+        this.infoBroadcastInterval = null;
+        /** @type {Set<IncomingToolSocket>} connections whose info THIS feature enabled */
+        this.infoAutoEnabled = new Set();
+
         this.server.on('listening', (...args) => {
             this.triggerEvent('listening', ...args);
         });
@@ -47,6 +55,11 @@ class ToolSocketServer {
 
             socket.on('close', () => {
                 this.sockets.splice(this.sockets.indexOf(toolSocket), 1);
+                this.infoAutoEnabled.delete(toolSocket);
+                // A closing subscriber ends its own subscription
+                if (this.infoSubscribers.has(toolSocket)) {
+                    this.unsubscribeServerInfo(toolSocket);
+                }
             });
         });
 
@@ -151,6 +164,77 @@ class ToolSocketServer {
 
     close() {
         this.server.close();
+    }
+
+    /**
+     * Starts streaming this server's info reports for ALL connections to the given
+     * subscriber socket via meta 'info/report' bundles, every 5 seconds, until
+     * unsubscribeServerInfo() or the subscriber's connection closes. Normally invoked
+     * through the client-side info(true, callback) API rather than directly. Enables
+     * info on every connection that doesn't have it yet (and turns exactly those off
+     * again when the last subscriber leaves, unless a local callback was attached to
+     * them in the meantime).
+     * @param {IncomingToolSocket} subscriber
+     */
+    subscribeServerInfo(subscriber) {
+        this.infoSubscribers.add(subscriber);
+        if (!this.infoBroadcastInterval) {
+            this.infoBroadcastInterval = setInterval(() => this._broadcastServerInfo(), 5000);
+            if (this.infoBroadcastInterval.unref) {
+                this.infoBroadcastInterval.unref();
+            }
+            this._broadcastServerInfo(); // arm info on all connections right away
+        }
+    }
+
+    /**
+     * Ends a subscriber's info stream. When the last subscriber leaves, the
+     * broadcast stops and auto-enabled connection info is turned off again.
+     * @param {IncomingToolSocket} subscriber
+     */
+    unsubscribeServerInfo(subscriber) {
+        this.infoSubscribers.delete(subscriber);
+        if (this.infoSubscribers.size > 0 || !this.infoBroadcastInterval) {
+            return;
+        }
+        clearInterval(this.infoBroadcastInterval);
+        this.infoBroadcastInterval = null;
+        for (const socket of this.infoAutoEnabled) {
+            // Leave info running if someone attached a local callback meanwhile
+            if (socket.infoHandler && !socket.infoHandler.callback) {
+                socket.info(false);
+            }
+        }
+        this.infoAutoEnabled.clear();
+    }
+
+    /**
+     * Collects every connection's latest info report and pushes one bundle to each
+     * subscriber. Also enables info on connections that joined after subscription.
+     */
+    _broadcastServerInfo() {
+        const reports = [];
+        for (const socket of this.sockets) {
+            if (!socket.infoHandler && socket.connected && socket.info) {
+                socket.info(true); // no callback: reports land in latestReport only
+                this.infoAutoEnabled.add(socket);
+            }
+            if (socket.infoHandler && socket.infoHandler.latestReport) {
+                reports.push(socket.infoHandler.latestReport);
+            }
+        }
+        const bundle = {
+            type: 'serverInfo',
+            timestamp: Date.now(),
+            connections: this.sockets.length,
+            reports: reports,
+            stagedProbe: this.lastStagedProbeResult,
+        };
+        for (const subscriber of this.infoSubscribers) {
+            if (subscriber.connected) {
+                subscriber.meta('info/report', bundle);
+            }
+        }
     }
 
     /**

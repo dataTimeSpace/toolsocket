@@ -215,6 +215,8 @@ class ToolSocketInfo {
         this.toolsocket = toolsocket;
         /** @type {?function} */
         this.callback = null;
+        /** @type {?Object} the most recent report, kept for server-side collection */
+        this.latestReport = null;
         this.active = false;
         /**
          * eventType -> handler map of every listener this instance registered,
@@ -589,10 +591,7 @@ class ToolSocketInfo {
         this.tickCount = 0;
         this.windowStartMs = Date.now();
 
-        if (!this.callback) {
-            return;
-        }
-        this.callback({
+        const report = {
             type: 'info',
             timestamp: Date.now(),
             data: {
@@ -604,7 +603,11 @@ class ToolSocketInfo {
                 probe: this.probeResult,
                 history: history,
             },
-        });
+        };
+        this.latestReport = report;
+        if (this.callback) {
+            this.callback(report);
+        }
     }
 
     /**
