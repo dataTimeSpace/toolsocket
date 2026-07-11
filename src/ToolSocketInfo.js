@@ -13,13 +13,16 @@
  *     type:      'info'
  *     timestamp: number  — Date.now() at the moment the report is pushed
  *     data: {
- *       latency: {
+ *       networkLatency: {  — round trips of WebSocket protocol-level ping/pong frames
  *         currentMs: number  — round trip time of the most recent ping/pong
  *         averageMs: number  — average over samples since the last report
  *         minMs:     number  — fastest sample since the last report
  *         maxMs:     number  — slowest sample since the last report
  *         samples:   number  — how many pings were measured since the last report
  *       } | null             — null if no ping completed since the last report
+ *       appLatency: {        — round trips of application-level ToolSocket ping messages
+ *         (same fields as networkLatency)
+ *       } | null
  *       transport: {
  *         averageBytesPerSecond: number — total traffic / elapsed time since last report
  *         peakBytesPerSecond:    number — busiest single 1s bucket since the last report
@@ -29,12 +32,24 @@
  *     }
  *   }
  *
- * How latency is measured: ToolSocket's built-in keepalive sends a 'ping' message
- * (route 'action/ping') every ~5s with a response callback, which assigns it a message
- * id. We listen to the 'send' event to record the send time of each ping id, and to
- * the 'res' event to match the incoming response id back to it. The difference is the
- * application-level round trip time between the server and that connected client, as
- * measured on the server-side IncomingToolSocket, which runs its own keepalive loop.
+ * How latency is measured — two complementary signals:
+ *
+ * networkLatency: on each 1 Hz tick a WebSocket protocol-level PING control frame
+ * (RFC 6455) is sent via the ws library with a timestamp embedded in its payload; the
+ * peer's networking layer echoes it back in the PONG frame, and the timestamp is read
+ * straight out of it (stateless, no pending map). Control frames are ~10 bytes and are
+ * answered below the application — no JSON parsing, no routing, no user code — so this
+ * approximates pure network round trip time. In browsers the reply comes from the
+ * network stack, largely independent of main-thread load; note that Node.js peers
+ * answer PINGs on their event loop, so a fully blocked Node peer delays these too.
+ *
+ * appLatency: ToolSocket's built-in keepalive sends an application-level 'ping'
+ * message (route 'action/ping') every ~5s with a response callback, which assigns it
+ * a message id. We listen to the 'send' event to record the send time of each ping id
+ * and to the 'res' event to match the response id back to it. This round trip includes
+ * the peer's full message pipeline (event loop, JSON parse, schema validation, route
+ * dispatch), so appLatency minus networkLatency approximates client-side processing
+ * pressure.
  *
  * How transport is measured (zero per-message overhead): Node.js already maintains
  * byte counters on every TCP socket (net.Socket bytesRead / bytesWritten) — they are
@@ -51,6 +66,8 @@ const BUCKET_INTERVAL_MS = 1000;
 const BUCKETS_PER_REPORT = 5; // push a report to the callback every 5 seconds
 // Drop pending pings that never got a response (e.g. connection dropped mid-flight)
 const PENDING_PING_TIMEOUT_MS = 30000;
+// Marks our protocol-level PING payloads so we only interpret our own PONGs
+const PROTOCOL_PING_PREFIX = 'tsinfo:';
 
 const now = (typeof performance !== 'undefined' && performance.now)
     ? () => performance.now()
@@ -76,13 +93,23 @@ class ToolSocketInfo {
         this.tickCount = 0;
         this.windowStartMs = 0;
 
-        // --- latency state ---
+        // --- app latency state (ToolSocket-level ping messages) ---
         /** @type {Object<string, number>} ping message id -> send time */
-        this.pendingPings = {};
+        this.pendingAppPings = {};
         /** @type {number[]} completed round trip times since the last report */
-        this.latencySamples = [];
+        this.appLatencySamples = [];
         /** @type {?number} most recent completed round trip time */
-        this.lastLatencyMs = null;
+        this.lastAppLatencyMs = null;
+
+        // --- network latency state (WebSocket protocol-level PING/PONG frames) ---
+        /** @type {?Object} the ws WebSocket our 'pong' listener is attached to */
+        this.pingedSocket = null;
+        /** @type {?function} */
+        this.pongHandler = null;
+        /** @type {number[]} completed round trip times since the last report */
+        this.networkLatencySamples = [];
+        /** @type {?number} most recent completed round trip time */
+        this.lastNetworkLatencyMs = null;
 
         // --- transport state ---
         // Baseline sample of the underlying net.Socket's built-in byte counters
@@ -113,12 +140,12 @@ class ToolSocketInfo {
         }
         this.active = true;
 
-        // --- latency collection ------------------------------------------
+        // --- app latency collection ---------------------------------------
         // Record the send time of every outgoing ping that expects a response
         this._listen('send', (messageBundle) => {
             const message = messageBundle && messageBundle.message;
             if (message && message.method === 'ping' && message.id) {
-                this.pendingPings[message.id] = now();
+                this.pendingAppPings[message.id] = now();
             }
         });
         // Match incoming responses back to their ping by message id
@@ -127,15 +154,18 @@ class ToolSocketInfo {
             if (!message || !message.id) {
                 return;
             }
-            const sentAt = this.pendingPings[message.id];
+            const sentAt = this.pendingAppPings[message.id];
             if (sentAt === undefined) {
                 return;
             }
-            delete this.pendingPings[message.id];
+            delete this.pendingAppPings[message.id];
             const roundTripMs = Math.round((now() - sentAt) * 10) / 10;
-            this.lastLatencyMs = roundTripMs;
-            this.latencySamples.push(roundTripMs);
+            this.lastAppLatencyMs = roundTripMs;
+            this.appLatencySamples.push(roundTripMs);
         });
+
+        // --- network latency collection ------------------------------------
+        this._ensureProtocolPingHooks();
 
         // --- transport collection: baseline the TCP counters ---------------
         this._sampleSocketCounters(); // establishes the baseline, returns zero deltas
@@ -164,9 +194,12 @@ class ToolSocketInfo {
             this.toolsocket.removeEventListener(eventType, handler);
         }
         this.listeners = {};
-        this.pendingPings = {};
-        this.latencySamples = [];
-        this.lastLatencyMs = null;
+        this._detachProtocolPingHooks();
+        this.pendingAppPings = {};
+        this.appLatencySamples = [];
+        this.lastAppLatencyMs = null;
+        this.networkLatencySamples = [];
+        this.lastNetworkLatencyMs = null;
         this.countedSocket = null;
         this.lastBytesRead = 0;
         this.lastBytesWritten = 0;
@@ -190,6 +223,11 @@ class ToolSocketInfo {
         this.windowBytesSent += deltaWritten;
         this.windowBytesReceived += deltaRead;
 
+        // Network latency: one protocol-level ping per tick (re-hooking if the
+        // underlying socket was replaced)
+        this._ensureProtocolPingHooks();
+        this._sendProtocolPing();
+
         this.tickCount++;
         if (this.tickCount >= BUCKETS_PER_REPORT) {
             this._report();
@@ -202,17 +240,10 @@ class ToolSocketInfo {
     _report() {
         this._prunePendingPings();
 
-        let latency = null;
-        if (this.latencySamples.length > 0) {
-            const sum = this.latencySamples.reduce((a, b) => a + b, 0);
-            latency = {
-                currentMs: this.lastLatencyMs,
-                averageMs: Math.round((sum / this.latencySamples.length) * 10) / 10,
-                minMs: Math.min(...this.latencySamples),
-                maxMs: Math.max(...this.latencySamples),
-                samples: this.latencySamples.length,
-            };
-        }
+        const networkLatency = this._summarizeLatency(
+            this.networkLatencySamples, this.lastNetworkLatencyMs);
+        const appLatency = this._summarizeLatency(
+            this.appLatencySamples, this.lastAppLatencyMs);
 
         // Use real elapsed time, not the nominal window length: under heavy event
         // loop load, timers fire late and the nominal value would overstate rates
@@ -226,7 +257,8 @@ class ToolSocketInfo {
         };
 
         // Reset the collection window
-        this.latencySamples = [];
+        this.networkLatencySamples = [];
+        this.appLatencySamples = [];
         this.windowBytesSent = 0;
         this.windowBytesReceived = 0;
         this.peakBytesPerSecond = 0;
@@ -240,7 +272,8 @@ class ToolSocketInfo {
             type: 'info',
             timestamp: Date.now(),
             data: {
-                latency: latency,
+                networkLatency: networkLatency,
+                appLatency: appLatency,
                 transport: transport,
             },
         });
@@ -275,13 +308,93 @@ class ToolSocketInfo {
     }
 
     /**
+     * Attaches the protocol-level 'pong' listener to the current underlying ws
+     * WebSocket. No-op if already attached to it; re-attaches if it was replaced.
+     * The 'pong' event is part of ws's Node.js EventEmitter API, so this quietly
+     * does nothing on sockets that don't support it.
+     */
+    _ensureProtocolPingHooks() {
+        const websocket = this.toolsocket.socket;
+        if (websocket === this.pingedSocket) {
+            return;
+        }
+        this._detachProtocolPingHooks();
+        if (!websocket || typeof websocket.on !== 'function') {
+            return;
+        }
+        this.pongHandler = (data) => {
+            const text = data.toString();
+            if (!text.startsWith(PROTOCOL_PING_PREFIX)) {
+                return; // a pong for someone else's ping
+            }
+            const sentAt = parseFloat(text.slice(PROTOCOL_PING_PREFIX.length));
+            if (!isFinite(sentAt)) {
+                return;
+            }
+            const roundTripMs = Math.round((now() - sentAt) * 10) / 10;
+            this.lastNetworkLatencyMs = roundTripMs;
+            this.networkLatencySamples.push(roundTripMs);
+        };
+        websocket.on('pong', this.pongHandler);
+        this.pingedSocket = websocket;
+    }
+
+    /**
+     * Detaches the protocol-level 'pong' listener, if attached
+     */
+    _detachProtocolPingHooks() {
+        if (this.pingedSocket && this.pongHandler
+            && typeof this.pingedSocket.off === 'function') {
+            this.pingedSocket.off('pong', this.pongHandler);
+        }
+        this.pingedSocket = null;
+        this.pongHandler = null;
+    }
+
+    /**
+     * Sends one WebSocket protocol-level PING frame with the current time embedded
+     * in its payload, so the echoed PONG carries its own send time (stateless RTT).
+     */
+    _sendProtocolPing() {
+        const websocket = this.toolsocket.socket;
+        if (!websocket || typeof websocket.ping !== 'function' || websocket.readyState !== 1) {
+            return;
+        }
+        try {
+            websocket.ping(PROTOCOL_PING_PREFIX + now());
+        } catch (_e) {
+            // socket raced into a closing state; skip this sample
+        }
+    }
+
+    /**
+     * Summarizes a window of round trip samples into the report's latency shape
+     * @param {number[]} samples
+     * @param {?number} currentMs - the most recent round trip measured
+     * @returns {?Object} stats, or null if there were no samples this window
+     */
+    _summarizeLatency(samples, currentMs) {
+        if (samples.length === 0) {
+            return null;
+        }
+        const sum = samples.reduce((a, b) => a + b, 0);
+        return {
+            currentMs: currentMs,
+            averageMs: Math.round((sum / samples.length) * 10) / 10,
+            minMs: Math.min(...samples),
+            maxMs: Math.max(...samples),
+            samples: samples.length,
+        };
+    }
+
+    /**
      * Drops pending ping entries that never received a response
      */
     _prunePendingPings() {
         const cutoff = now() - PENDING_PING_TIMEOUT_MS;
-        for (const [id, sentAt] of Object.entries(this.pendingPings)) {
+        for (const [id, sentAt] of Object.entries(this.pendingAppPings)) {
             if (sentAt < cutoff) {
-                delete this.pendingPings[id];
+                delete this.pendingAppPings[id];
             }
         }
     }
