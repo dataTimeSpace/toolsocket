@@ -723,6 +723,9 @@ class ToolSocket {
      * @param {string[]} [options.probeIds] - Probe only the connections with one of
      *     these ids (data.id in the server's info reports); addresses any
      *     connection, named or not
+     * @param {boolean} [options.probeRamp] - Pass false to skip the growing 2, 4,
+     *     8... intermediate stages: the probe then measures each connection alone
+     *     and all of them at once, nothing in between
      */
     info(enabled = false, infoCallback, options) {
         if (enabled) {
@@ -750,6 +753,9 @@ class ToolSocket {
                 }
                 if (Array.isArray(options.probeIds) && options.probeIds.length > 0) {
                     probeBody.ids = options.probeIds.slice(0, 128);
+                }
+                if (options.probeRamp === false) {
+                    probeBody.ramp = false;
                 }
                 this.meta('info/probe', Object.keys(probeBody).length ? probeBody : null);
             }
