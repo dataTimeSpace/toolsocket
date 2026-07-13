@@ -715,8 +715,11 @@ class ToolSocket {
      *     (undefined) to keep the current callback.
      * @param {?Object} [options]
      * @param {boolean} [options.probe] - Ask the server to run a staged throughput
-     *     probe across all its connections (results appear in stagedProbe)
+     *     probe across its connections (results appear in stagedProbe and in each
+     *     probed connection's data.probe)
      * @param {number} [options.probeSizeBytes] - Payload per direction per probe
+     * @param {string[]} [options.probeNames] - Probe only the connections carrying
+     *     one of these names (assigned via infoName()); omit to probe all
      */
     info(enabled = false, infoCallback, options) {
         if (enabled) {
@@ -737,8 +740,12 @@ class ToolSocket {
                 }
             }
             if (options && options.probe) {
-                this.meta('info/probe',
-                    options.probeSizeBytes ? {sizeBytes: options.probeSizeBytes} : null);
+                const probeBody = {};
+                if (options.probeSizeBytes) probeBody.sizeBytes = options.probeSizeBytes;
+                if (Array.isArray(options.probeNames) && options.probeNames.length > 0) {
+                    probeBody.names = options.probeNames.slice(0, 64);
+                }
+                this.meta('info/probe', Object.keys(probeBody).length ? probeBody : null);
             }
         } else if (this.remoteInfoSubscribed) {
             this.remoteInfoSubscribed = false;

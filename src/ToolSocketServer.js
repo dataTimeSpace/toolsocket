@@ -281,6 +281,11 @@ class ToolSocketServer {
      * @param {number} [options.sizeBytes] - Payload per direction per probe (default 256 KB)
      * @param {boolean} [options.ramp] - Include the growing 2, 4, 8... stages between
      *                                   'individual' and all-at-once (default true)
+     * @param {string[]} [options.names] - Probe only the connections carrying one of
+     *                                     these names (assigned via infoName() or
+     *                                     info options.name) — e.g. just the clients
+     *                                     on one Wi-Fi. Unnamed connections cannot be
+     *                                     addressed this way. Omit to probe all.
      */
     stagedProbe(callback, options = {}) {
         if (typeof callback !== 'function') {
@@ -292,7 +297,12 @@ class ToolSocketServer {
         }
         // Lazy require: staged probing shares the dormant info module
         const ToolSocketInfo = require('./ToolSocketInfo.js');
-        const connections = this.sockets.filter(socket => socket.connected);
+        let connections = this.sockets.filter(socket => socket.connected);
+        if (Array.isArray(options.names) && options.names.length > 0) {
+            const wanted = new Set(options.names);
+            connections = connections.filter((socket) => wanted.has(
+                (socket.infoHandler && socket.infoHandler.connectionName) || socket.announcedInfoName));
+        }
         if (connections.length === 0) {
             callback({status: 'failed', reason: 'no-connections'});
             return;
@@ -314,7 +324,10 @@ class ToolSocketServer {
             }
         });
         const describe = (connection, result) => ({
-            name: (connection.infoHandler && connection.infoHandler.connectionName) || null,
+            // the handler's name when info is active, else the remotely announced one
+            // (infoName()) — probes can run without any info subscriber
+            name: (connection.infoHandler && connection.infoHandler.connectionName)
+                || connection.announcedInfoName || null,
             status: result.status,
             downstreamBytesPerSecond: result.downstreamBytesPerSecond,
             upstreamBytesPerSecond: result.upstreamBytesPerSecond,

@@ -139,6 +139,29 @@ describe('connection info API', () => {
         expect(server.lastStagedProbeResult).toBe(result);
     });
 
+    test('stagedProbe options.names probes only the named connections', async () => {
+        const started = await startServer();
+        server = started.server;
+        const wifiClient = await connectClient(started.port);
+        clients.push(wifiClient);
+        clients.push(await connectClient(started.port)); // unnamed bystander
+        wifiClient.infoName('wifi-A');
+        await wait(300);
+
+        const result = await new Promise((resolve) =>
+            server.stagedProbe(resolve, {sizeBytes: 32 * 1024, ramp: false, names: ['wifi-A']}));
+        expect(result.status).toBe('ok');
+        expect(result.connections).toBe(1);
+        expect(result.individual.perConnection).toHaveLength(1);
+        expect(result.individual.perConnection[0].name).toBe('wifi-A');
+
+        // a filter that matches nothing fails cleanly instead of probing everyone
+        const miss = await new Promise((resolve) =>
+            server.stagedProbe(resolve, {names: ['no-such-name']}));
+        expect(miss.status).toBe('failed');
+        expect(miss.reason).toBe('no-connections');
+    });
+
     test('client-side info() streams server bundles and stops on request', async () => {
         const started = await startServer();
         server = started.server;
