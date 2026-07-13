@@ -224,6 +224,17 @@ class ToolSocket {
                         }
                     }, body || {});
                 }
+            } else if (route === 'info/name') {
+                // The remote end names its own connection (e.g. the avatar or user
+                // it represents), sent via the client-side infoName() API. Stored on
+                // the socket — not the info handler — so it survives the info
+                // enable/disable cycles that come with subscribers joining/leaving.
+                const name = (body && typeof body.name === 'string' && body.name.length > 0)
+                    ? body.name.slice(0, 256) : null;
+                this.announcedInfoName = name;
+                if (this.infoHandler && this.infoHandler.setName) {
+                    this.infoHandler.setName(name);
+                }
             } else {
                 console.warn(`Received unknown meta route: "${route}"`);
             }
@@ -692,7 +703,7 @@ class ToolSocket {
      * ALL of its connections to this client via the given callback, every 5 seconds,
      * until info(false) is called or this connection closes. Rides on ToolSocket's
      * meta transport (routes info/subscribe, info/unsubscribe, info/report,
-     * info/probe) — the server only responds if it supports the info API. The
+     * info/probe, info/name) — the server only responds if it supports the info API. The
      * subscription automatically re-arms after a reconnect. Note: there is no
      * built-in authorization; gate access at the application level if needed.
      * (On server-side IncomingToolSockets this method is overridden by the local
@@ -733,6 +744,30 @@ class ToolSocket {
             this.remoteInfoSubscribed = false;
             this.remoteInfoCallback = null;
             this.meta('info/unsubscribe', null);
+        }
+    }
+
+    /**
+     * Client-side info API: names this connection on the connected server (e.g. the
+     * avatar or user id this client represents). The server keeps the name on the
+     * connection and stamps it into every info report as data.name whenever info is
+     * active — independent of whether this client ever subscribes. One tiny meta
+     * message per call; automatically re-sent after a reconnect. Call it once when
+     * the client knows who it is.
+     * @param {?string} name - up to 256 chars; null or '' clears the name
+     */
+    infoName(name) {
+        this.remoteInfoName = (typeof name === 'string' && name.length > 0)
+            ? name.slice(0, 256) : null;
+        this.meta('info/name', {name: this.remoteInfoName});
+        if (!this.remoteInfoNameReattachArmed) {
+            // Re-introduce ourselves when the connection re-opens
+            this.remoteInfoNameReattachArmed = true;
+            this.addEventListener('open', () => {
+                if (this.remoteInfoName) {
+                    this.meta('info/name', {name: this.remoteInfoName});
+                }
+            });
         }
     }
 

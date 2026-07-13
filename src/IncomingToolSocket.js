@@ -20,6 +20,15 @@ class IncomingToolSocket extends ToolSocket {
          */
         this.infoHandler = null;
 
+        /**
+         * Connection name announced by the remote end via the meta route info/name
+         * (client-side infoName() API). Lives on the socket rather than the handler
+         * so it survives info enable/disable cycles; stamped into the handler
+         * whenever info is (re-)enabled.
+         * @type {?string}
+         */
+        this.announcedInfoName = null;
+
         this.configureSocket();
     }
 
@@ -67,6 +76,10 @@ class IncomingToolSocket extends ToolSocket {
             this.infoHandler.start();
             if (options && typeof options.name === 'string') {
                 this.infoHandler.setName(options.name);
+            } else if (this.announcedInfoName) {
+                // name announced by the remote end (infoName()); re-applied on every
+                // enable, so it survives the auto-enable/disable subscriber cycles
+                this.infoHandler.setName(this.announcedInfoName);
             }
             if (options && options.probe) {
                 this.infoHandler.startProbe(options.probeSizeBytes);

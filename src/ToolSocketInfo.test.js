@@ -167,6 +167,49 @@ describe('connection info API', () => {
         expect(server.sockets.every((socket) => socket.infoHandler === null)).toBe(true);
     });
 
+    test('client-side infoName() names the connection and the name survives enable/disable cycles', async () => {
+        const started = await startServer();
+        server = started.server;
+        const connectionPromise = new Promise((resolve) => server.on('connection', resolve));
+        const namedClient = await connectClient(started.port);
+        clients.push(namedClient);
+        const namedServerSocket = await connectionPromise;
+
+        // Announcing a name is not an info activation: the socket stays dormant
+        namedClient.infoName('avatar-alice');
+        await wait(300);
+        expect(namedServerSocket.announcedInfoName).toBe('avatar-alice');
+        expect(namedServerSocket.infoHandler).toBeNull();
+
+        // A subscriber auto-enables info on all connections: reports carry the name
+        const subscriber = await connectClient(started.port);
+        clients.push(subscriber);
+        const bundles = [];
+        subscriber.info(true, (bundle) => bundles.push(bundle));
+        await wait(11500);
+        const names = bundles.flatMap((b) => b.reports.map((r) => r.data && r.data.name));
+        expect(names).toContain('avatar-alice');
+
+        // Last subscriber leaves: info returns to dormant but the name is retained...
+        subscriber.info(false);
+        await wait(300);
+        expect(namedServerSocket.infoHandler).toBeNull();
+        expect(namedServerSocket.announcedInfoName).toBe('avatar-alice');
+
+        // ...so a fresh subscription still sees the named connection
+        const bundlesAgain = [];
+        subscriber.info(true, (bundle) => bundlesAgain.push(bundle));
+        await wait(11500);
+        const namesAgain = bundlesAgain.flatMap((b) => b.reports.map((r) => r.data && r.data.name));
+        expect(namesAgain).toContain('avatar-alice');
+        subscriber.info(false);
+
+        // Clearing the name
+        namedClient.infoName(null);
+        await wait(300);
+        expect(namedServerSocket.announcedInfoName).toBeNull();
+    });
+
     test('removeEventListener removes exactly the given listener', () => {
         const socket = new ToolSocket();
         const calls = [];
