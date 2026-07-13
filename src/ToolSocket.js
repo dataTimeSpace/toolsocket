@@ -720,6 +720,9 @@ class ToolSocket {
      * @param {number} [options.probeSizeBytes] - Payload per direction per probe
      * @param {string[]} [options.probeNames] - Probe only the connections carrying
      *     one of these names (assigned via infoName()); omit to probe all
+     * @param {string[]} [options.probeIds] - Probe only the connections with one of
+     *     these ids (data.id in the server's info reports); addresses any
+     *     connection, named or not
      */
     info(enabled = false, infoCallback, options) {
         if (enabled) {
@@ -744,6 +747,9 @@ class ToolSocket {
                 if (options.probeSizeBytes) probeBody.sizeBytes = options.probeSizeBytes;
                 if (Array.isArray(options.probeNames) && options.probeNames.length > 0) {
                     probeBody.names = options.probeNames.slice(0, 64);
+                }
+                if (Array.isArray(options.probeIds) && options.probeIds.length > 0) {
+                    probeBody.ids = options.probeIds.slice(0, 128);
                 }
                 this.meta('info/probe', Object.keys(probeBody).length ? probeBody : null);
             }
@@ -776,6 +782,13 @@ class ToolSocket {
                 }
             });
         }
+        // parallel sockets belong to this connection: keep their names in sync so
+        // diagnostics group them under this name even when naming happens late
+        if (this.parallelSockets) {
+            for (const parallel of this.parallelSockets) {
+                parallel.infoName(this.remoteInfoName ? this.remoteInfoName + ' · data' : null);
+            }
+        }
     }
 
     /**
@@ -798,7 +811,16 @@ class ToolSocket {
      * @returns {ToolSocket} - A new ToolSocket created to the same endpoint as the original.
      */
     static makeParallelSocket(toolsocket) {
-        return new ToolSocket(toolsocket.url, toolsocket.networkId, 'parallel');
+        const parallel = new ToolSocket(toolsocket.url, toolsocket.networkId, 'parallel');
+        // a parallel socket belongs to its source connection: track it and inherit
+        // the announced name (suffixed) so diagnostics group it under its parent —
+        // infoName() keeps the children in sync if the parent is named later
+        if (!toolsocket.parallelSockets) toolsocket.parallelSockets = [];
+        toolsocket.parallelSockets.push(parallel);
+        if (toolsocket.remoteInfoName) {
+            parallel.infoName(toolsocket.remoteInfoName + ' · data');
+        }
+        return parallel;
     }
 }
 

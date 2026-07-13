@@ -154,6 +154,15 @@ describe('connection info API', () => {
         expect(result.connections).toBe(1);
         expect(result.individual.perConnection).toHaveLength(1);
         expect(result.individual.perConnection[0].name).toBe('wifi-A');
+        expect(typeof result.individual.perConnection[0].id).toBe('string');
+
+        // ids address any connection, named or not
+        const wifiId = result.individual.perConnection[0].id;
+        const byId = await new Promise((resolve) =>
+            server.stagedProbe(resolve, {sizeBytes: 32 * 1024, ramp: false, ids: [wifiId]}));
+        expect(byId.status).toBe('ok');
+        expect(byId.connections).toBe(1);
+        expect(byId.individual.perConnection[0].id).toBe(wifiId);
 
         // a filter that matches nothing fails cleanly instead of probing everyone
         const miss = await new Promise((resolve) =>

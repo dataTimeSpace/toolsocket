@@ -284,8 +284,11 @@ class ToolSocketServer {
      * @param {string[]} [options.names] - Probe only the connections carrying one of
      *                                     these names (assigned via infoName() or
      *                                     info options.name) — e.g. just the clients
-     *                                     on one Wi-Fi. Unnamed connections cannot be
-     *                                     addressed this way. Omit to probe all.
+     *                                     on one Wi-Fi. Omit to probe all.
+     * @param {string[]} [options.ids] - Probe only the connections with one of these
+     *                                   ids (data.id in info reports) — addresses any
+     *                                   connection, named or not. Combines with
+     *                                   options.names as a union.
      */
     stagedProbe(callback, options = {}) {
         if (typeof callback !== 'function') {
@@ -298,10 +301,13 @@ class ToolSocketServer {
         // Lazy require: staged probing shares the dormant info module
         const ToolSocketInfo = require('./ToolSocketInfo.js');
         let connections = this.sockets.filter(socket => socket.connected);
-        if (Array.isArray(options.names) && options.names.length > 0) {
-            const wanted = new Set(options.names);
-            connections = connections.filter((socket) => wanted.has(
-                (socket.infoHandler && socket.infoHandler.connectionName) || socket.announcedInfoName));
+        const wantedNames = (Array.isArray(options.names) && options.names.length > 0) ? new Set(options.names) : null;
+        const wantedIds = (Array.isArray(options.ids) && options.ids.length > 0) ? new Set(options.ids) : null;
+        if (wantedNames || wantedIds) {
+            connections = connections.filter((socket) =>
+                (wantedIds && wantedIds.has(socket.infoId)) ||
+                (wantedNames && wantedNames.has(
+                    (socket.infoHandler && socket.infoHandler.connectionName) || socket.announcedInfoName)));
         }
         if (connections.length === 0) {
             callback({status: 'failed', reason: 'no-connections'});
@@ -324,6 +330,7 @@ class ToolSocketServer {
             }
         });
         const describe = (connection, result) => ({
+            id: connection.infoId || null,
             // the handler's name when info is active, else the remotely announced one
             // (infoName()) — probes can run without any info subscriber
             name: (connection.infoHandler && connection.infoHandler.connectionName)

@@ -598,6 +598,7 @@ class ToolSocketInfo {
             type: 'info',
             timestamp: Date.now(),
             data: {
+                id: this.toolsocket.infoId || null,
                 name: this.connectionName,
                 networkLatency: networkLatency,
                 appLatency: appLatency,

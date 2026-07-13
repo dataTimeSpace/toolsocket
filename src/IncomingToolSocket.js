@@ -1,4 +1,5 @@
 const ToolSocket = require("./ToolSocket");
+const { generateUniqueId } = require("./utilities.js");
 
 class IncomingToolSocket extends ToolSocket {
     /**
@@ -19,6 +20,14 @@ class IncomingToolSocket extends ToolSocket {
          * @type {?Object}
          */
         this.infoHandler = null;
+
+        /**
+         * Stable identifier for this connection, included in every info report as
+         * data.id — lets UIs and the staged probe address a specific connection
+         * (named or not) for its whole lifetime.
+         * @type {string}
+         */
+        this.infoId = generateUniqueId(8);
 
         /**
          * Connection name announced by the remote end via the meta route info/name
