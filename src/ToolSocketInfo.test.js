@@ -12,6 +12,17 @@ jest.setTimeout(45000);
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Poll until the condition holds — generous ceiling so timing-sensitive
+// expectations survive slow CI runners and parallel-suite contention.
+async function until(condition, timeoutMs = 25000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (condition()) return true;
+        await wait(150);
+    }
+    return condition();
+}
+
 async function startServer() {
     const server = new ToolSocket.Server({port: 0});
     await new Promise((resolve) => server.on('listening', resolve));
@@ -60,7 +71,7 @@ describe('connection info API', () => {
         serverSocket.info(true, (report) => reports.push(report), {name: 'jest-user'});
         expect(require.cache[infoModulePath]).toBeDefined();
 
-        await wait(5600);
+        await until(() => reports.length >= 1);
         expect(reports.length).toBeGreaterThanOrEqual(1);
         const data = reports[0].data;
         expect(reports[0].type).toBe('info');
@@ -95,7 +106,7 @@ describe('connection info API', () => {
         serverSocket.info(true, (report) => reports.push(report));
         await wait(300);
         client.close(); // orderly close handshake (close frame without status code)
-        await wait(500);
+        await until(() => reports.length > 0 && reports[reports.length - 1].data.networkQuality.flow === 'ended');
 
         const finalReport = reports[reports.length - 1];
         expect(finalReport.data.networkQuality.flow).toBe('ended');
@@ -182,7 +193,7 @@ describe('connection info API', () => {
 
         const bundles = [];
         subscriber.info(true, (bundle) => bundles.push(bundle));
-        await wait(6500);
+        await until(() => bundles.length >= 1 && bundles[bundles.length - 1].connections === 2);
 
         expect(bundles.length).toBeGreaterThanOrEqual(1);
         const bundle = bundles[bundles.length - 1];
@@ -220,7 +231,7 @@ describe('connection info API', () => {
         clients.push(subscriber);
         const bundles = [];
         subscriber.info(true, (bundle) => bundles.push(bundle));
-        await wait(11500);
+        await until(() => bundles.some((b) => b.reports.some((r) => r.data && r.data.name === 'avatar-alice')));
         const names = bundles.flatMap((b) => b.reports.map((r) => r.data && r.data.name));
         expect(names).toContain('avatar-alice');
 
@@ -233,7 +244,7 @@ describe('connection info API', () => {
         // ...so a fresh subscription still sees the named connection
         const bundlesAgain = [];
         subscriber.info(true, (bundle) => bundlesAgain.push(bundle));
-        await wait(11500);
+        await until(() => bundlesAgain.some((b) => b.reports.some((r) => r.data && r.data.name === 'avatar-alice')));
         const namesAgain = bundlesAgain.flatMap((b) => b.reports.map((r) => r.data && r.data.name));
         expect(namesAgain).toContain('avatar-alice');
         subscriber.info(false);
