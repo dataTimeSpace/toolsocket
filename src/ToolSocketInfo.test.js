@@ -1,3 +1,5 @@
+/* global jest, describe, test, expect, afterEach */
+
 /**
  * Integration tests for the connection info API: per-connection info reports
  * (ToolSocketInfo), throughput probes, the server-wide staged probe, and the
