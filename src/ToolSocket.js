@@ -3,7 +3,7 @@ const ToolSocketMessage = require('./ToolSocketMessage.js');
 const ToolSocketResponse = require('./ToolSocketResponse.js');
 const MessageBundle = require('./MessageBundle.js');
 
-const { generateUniqueId, addSearchParams, isBrowser, WebSocketWrapper } = require('./utilities.js');
+const { generateUniqueId, addSearchParams, isBrowser, WebSocketWrapper, makeProbePayload } = require('./utilities.js');
 const { VALID_METHODS, MAX_MESSAGE_SIZE } = require('./constants.js');
 const { URL_SCHEMA, MESSAGE_BUNDLE_SCHEMA } = require('./schemas.js');
 
@@ -27,6 +27,12 @@ class ToolSocket {
 
         this.eventCallbacks = {}; // For events
         this.responseCallbacks = {}; // For handling direct responses to sent messages
+
+        // Client-side remote info subscription state (see info())
+        /** @type {?function} */
+        this.remoteInfoCallback = null;
+        this.remoteInfoSubscribed = false;
+        this.remoteInfoReattachArmed = false;
         /** @type {?BinaryBuffer} */
         this.binaryBuffer = null;
 
@@ -129,6 +135,22 @@ class ToolSocket {
     }
 
     /**
+     * Removes a previously added event listener
+     * @param {string} eventType - The event type the listener was added for
+     * @param {function} callback - The exact callback that was passed to addEventListener
+     */
+    removeEventListener(eventType, callback) {
+        if (!this.eventCallbacks[eventType]) {
+            return;
+        }
+        this.eventCallbacks[eventType] = this.eventCallbacks[eventType].filter(cb => cb !== callback);
+        if (this.eventCallbacks[eventType].length === 0) {
+            // Restore the "no listeners" fast path in triggerEvent
+            delete this.eventCallbacks[eventType];
+        }
+    }
+
+    /**
      * Clears all event listeners
      */
     removeAllListeners() {
@@ -158,11 +180,61 @@ class ToolSocket {
             }
         });
 
-        this.addEventListener('meta', (route, body, _response, _binaryData, _messageBundle) => {
+        this.addEventListener('meta', (route, body, response, _binaryData, _messageBundle) => {
             if (route === 'requestParallel') {
                 this.triggerEvent('requestParallel', body); // body = id
             } else if (route === 'confirmParallel') {
                 this.triggerEvent('confirmParallel', body); // body = id
+            } else if (route === 'probe/down') {
+                // Throughput probe (see ToolSocketInfo.js): a large payload just
+                // arrived; a tiny acknowledgement lets the sender compute the
+                // downstream rate. Only runs when a probe is explicitly requested.
+                if (response) {
+                    response.send('ok');
+                }
+            } else if (route === 'probe/up') {
+                // Throughput probe: the sender asks for `body` bytes of
+                // incompressible data to measure the upstream rate
+                if (response) {
+                    response.send('ok', makeProbePayload(body));
+                }
+            } else if (route === 'info/report') {
+                // A server-info bundle pushed by the other side for a subscription
+                // created via the client-side info(true, callback) API
+                if (this.remoteInfoCallback) {
+                    this.remoteInfoCallback(body);
+                }
+            } else if (route === 'info/subscribe') {
+                // Only meaningful on server-side sockets (this.server is set there)
+                if (this.server && this.server.subscribeServerInfo) {
+                    this.server.subscribeServerInfo(this);
+                }
+            } else if (route === 'info/unsubscribe') {
+                if (this.server && this.server.unsubscribeServerInfo) {
+                    this.server.unsubscribeServerInfo(this);
+                }
+            } else if (route === 'info/probe') {
+                // Client-requested staged throughput probe across all connections;
+                // the result is sent back as the response and also appears in the
+                // stagedProbe field of subsequent info/report bundles
+                if (this.server && this.server.stagedProbe) {
+                    this.server.stagedProbe((result) => {
+                        if (response) {
+                            response.send(result);
+                        }
+                    }, body || {});
+                }
+            } else if (route === 'info/name') {
+                // The remote end names its own connection (e.g. the avatar or user
+                // it represents), sent via the client-side infoName() API. Stored on
+                // the socket — not the info handler — so it survives the info
+                // enable/disable cycles that come with subscribers joining/leaving.
+                const name = (body && typeof body.name === 'string' && body.name.length > 0)
+                    ? body.name.slice(0, 256) : null;
+                this.announcedInfoName = name;
+                if (this.infoHandler && this.infoHandler.setName) {
+                    this.infoHandler.setName(name);
+                }
             } else {
                 console.warn(`Received unknown meta route: "${route}"`);
             }
@@ -627,6 +699,105 @@ class ToolSocket {
     }
 
     /**
+     * Client-side info API: asks the connected server to stream its info reports for
+     * ALL of its connections to this client via the given callback, every 5 seconds,
+     * until info(false) is called or this connection closes. Rides on ToolSocket's
+     * meta transport (routes info/subscribe, info/unsubscribe, info/report,
+     * info/probe, info/name) — the server only responds if it supports the info API. The
+     * subscription automatically re-arms after a reconnect. Note: there is no
+     * built-in authorization; gate access at the application level if needed.
+     * (On server-side IncomingToolSockets this method is overridden by the local
+     * per-connection info API.)
+     * @param {boolean} [enabled=false] - Start (true) or stop (false) the stream
+     * @param {?function} [infoCallback] - Receives {type: 'serverInfo', timestamp,
+     *     connections, reports: [per-connection info report objects], recentlyClosed:
+     *     [final reports of recently closed connections], stagedProbe}. Omit
+     *     (undefined) to keep the current callback.
+     * @param {?Object} [options]
+     * @param {boolean} [options.probe] - Ask the server to run a staged throughput
+     *     probe across its connections (results appear in stagedProbe and in each
+     *     probed connection's data.probe)
+     * @param {number} [options.probeSizeBytes] - Payload per direction per probe
+     * @param {string[]} [options.probeNames] - Probe only the connections carrying
+     *     one of these names (assigned via infoName()); omit to probe all
+     * @param {string[]} [options.probeIds] - Probe only the connections with one of
+     *     these ids (data.id in the server's info reports); addresses any
+     *     connection, named or not
+     * @param {boolean} [options.probeRamp] - Pass false to skip the growing 2, 4,
+     *     8... intermediate stages: the probe then measures each connection alone
+     *     and all of them at once, nothing in between
+     */
+    info(enabled = false, infoCallback, options) {
+        if (enabled) {
+            if (infoCallback !== undefined) {
+                this.remoteInfoCallback = infoCallback || null;
+            }
+            if (!this.remoteInfoSubscribed) {
+                this.remoteInfoSubscribed = true;
+                this.meta('info/subscribe', null);
+                if (!this.remoteInfoReattachArmed) {
+                    // Re-subscribe automatically when the connection re-opens
+                    this.remoteInfoReattachArmed = true;
+                    this.addEventListener('open', () => {
+                        if (this.remoteInfoSubscribed) {
+                            this.meta('info/subscribe', null);
+                        }
+                    });
+                }
+            }
+            if (options && options.probe) {
+                const probeBody = {};
+                if (options.probeSizeBytes) probeBody.sizeBytes = options.probeSizeBytes;
+                if (Array.isArray(options.probeNames) && options.probeNames.length > 0) {
+                    probeBody.names = options.probeNames.slice(0, 64);
+                }
+                if (Array.isArray(options.probeIds) && options.probeIds.length > 0) {
+                    probeBody.ids = options.probeIds.slice(0, 128);
+                }
+                if (options.probeRamp === false) {
+                    probeBody.ramp = false;
+                }
+                this.meta('info/probe', Object.keys(probeBody).length ? probeBody : null);
+            }
+        } else if (this.remoteInfoSubscribed) {
+            this.remoteInfoSubscribed = false;
+            this.remoteInfoCallback = null;
+            this.meta('info/unsubscribe', null);
+        }
+    }
+
+    /**
+     * Client-side info API: names this connection on the connected server (e.g. the
+     * avatar or user id this client represents). The server keeps the name on the
+     * connection and stamps it into every info report as data.name whenever info is
+     * active — independent of whether this client ever subscribes. One tiny meta
+     * message per call; automatically re-sent after a reconnect. Call it once when
+     * the client knows who it is.
+     * @param {?string} name - up to 256 chars; null or '' clears the name
+     */
+    infoName(name) {
+        this.remoteInfoName = (typeof name === 'string' && name.length > 0)
+            ? name.slice(0, 256) : null;
+        this.meta('info/name', {name: this.remoteInfoName});
+        if (!this.remoteInfoNameReattachArmed) {
+            // Re-introduce ourselves when the connection re-opens
+            this.remoteInfoNameReattachArmed = true;
+            this.addEventListener('open', () => {
+                if (this.remoteInfoName) {
+                    this.meta('info/name', {name: this.remoteInfoName});
+                }
+            });
+        }
+        // parallel sockets belong to this connection: keep their names in sync so
+        // diagnostics group them under this name even when naming happens late
+        if (this.parallelSockets) {
+            for (const parallel of this.parallelSockets) {
+                parallel.infoName(this.remoteInfoName ? this.remoteInfoName + ' · data' : null);
+            }
+        }
+    }
+
+    /**
      * Adds aliases for backwards compatibility
      */
     configureAliases() {
@@ -646,7 +817,16 @@ class ToolSocket {
      * @returns {ToolSocket} - A new ToolSocket created to the same endpoint as the original.
      */
     static makeParallelSocket(toolsocket) {
-        return new ToolSocket(toolsocket.url, toolsocket.networkId, 'parallel');
+        const parallel = new ToolSocket(toolsocket.url, toolsocket.networkId, 'parallel');
+        // a parallel socket belongs to its source connection: track it and inherit
+        // the announced name (suffixed) so diagnostics group it under its parent —
+        // infoName() keeps the children in sync if the parent is named later
+        if (!toolsocket.parallelSockets) toolsocket.parallelSockets = [];
+        toolsocket.parallelSockets.push(parallel);
+        if (toolsocket.remoteInfoName) {
+            parallel.infoName(toolsocket.remoteInfoName + ' · data');
+        }
+        return parallel;
     }
 }
 

@@ -146,3 +146,58 @@ clearly named getters and setters for ease of use. See `src/ToolSocketMessage.js
   f/frameCount: (number of binary buffers that will be sent following this message)
 }
 ```
+
+## Connection Info API
+
+Server-side diagnostics for realtime connection quality. Fully dormant until enabled:
+the info module is only loaded on first use and adds zero per-message overhead —
+measurement rides on TCP byte counters, WebSocket protocol ping/pong frames, and the
+existing keepalive, all sampled by a single 1 Hz ticker.
+
+### Per connection (server side)
+```javascript
+webSocketServer.on('connection', (socket) => {
+    socket.info(true, (report) => {
+        // Every 5 seconds:
+        // report.data.networkLatency  - protocol-level ping RTT (pure network path)
+        // report.data.appLatency      - application-level RTT (network + client pressure)
+        // report.data.transport       - exact wire bytes: average/peak per second, totals
+        // report.data.networkQuality  - score, rating, flow (realtime/buffered/stalled),
+        //                               trend, per-dimension sub-scores, issue flags
+        // report.data.history         - issue counts/episodes since info was enabled
+        // report.data.probe           - latest on-demand throughput probe result
+    }, {name: 'alice'}); // optional connection name, included as report.data.name
+
+    socket.info(true, undefined, {probe: true}); // one-shot up/downstream capacity probe
+    socket.info(false);                          // full teardown, back to dormant
+});
+```
+When the connection closes, one final report is pushed (`flow: 'ended'`, including
+the close code — an abnormal close without a handshake is the typical signature of
+proxies or zero-trust gateways cutting the socket).
+
+### Across all connections (server side)
+```javascript
+webSocketServer.stagedProbe((result) => {
+    // result.individual       - every client probed alone, sequentially (per-client limits)
+    // result.stages           - 2, 4, 8, ... clients probed simultaneously
+    // result.networkLimit     - all-at-once totals (shared-medium capacity)
+    // result.sharedBottleneck - ratio of individual sum to network limit; detected: true
+    //                           means clients limit each other (e.g. shared WiFi)
+}, {sizeBytes: 256 * 1024});
+```
+
+### Remote (client side)
+```javascript
+clientSocket.info(true, (bundle) => {
+    // Every 5 seconds, pushed by the server:
+    // bundle.reports        - info reports of ALL server connections
+    // bundle.recentlyClosed - final reports of recently closed connections
+    // bundle.stagedProbe    - latest staged probe result
+});
+clientSocket.info(true, undefined, {probe: true}); // trigger a server-wide staged probe
+clientSocket.info(false);                          // stop the stream
+```
+The stream also ends automatically when the subscribing connection closes. There is
+no built-in authorization: gate this at the application level if info reports should
+not be visible to every client.

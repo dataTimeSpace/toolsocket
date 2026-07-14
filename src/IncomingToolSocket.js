@@ -1,4 +1,5 @@
 const ToolSocket = require("./ToolSocket");
+const { generateUniqueId } = require("./utilities.js");
 
 class IncomingToolSocket extends ToolSocket {
     /**
@@ -12,7 +13,90 @@ class IncomingToolSocket extends ToolSocket {
         this.networkId = 'toolbox'; // Or 'io'?
         this.origin = server.origin;
         this.server = server;
+
+        /**
+         * Lazy-initialized info handler (see info()). Stays null while info mode is off,
+         * in which case the info module is never loaded and no info code runs at all.
+         * @type {?Object}
+         */
+        this.infoHandler = null;
+
+        /**
+         * Stable identifier for this connection, included in every info report as
+         * data.id — lets UIs and the staged probe address a specific connection
+         * (named or not) for its whole lifetime.
+         * @type {string}
+         */
+        this.infoId = generateUniqueId(8);
+
+        /**
+         * Connection name announced by the remote end via the meta route info/name
+         * (client-side infoName() API). Lives on the socket rather than the handler
+         * so it survives info enable/disable cycles; stamped into the handler
+         * whenever info is (re-)enabled.
+         * @type {?string}
+         */
+        this.announcedInfoName = null;
+
         this.configureSocket();
+    }
+
+    /**
+     * Enables or disables info updates about this server-side WebSocket connection.
+     * This API is server side only and intentionally not available on client sockets.
+     *
+     * When enabled is false (the default), the entire info subsystem is dormant:
+     * the info module is not loaded, no listeners are registered, and the send/receive
+     * hot paths carry zero extra processing overhead.
+     *
+     * When enabled is true, the info module is lazily loaded on first use and begins
+     * delivering info reports to the provided callback every 5 seconds. Calling
+     * info(true, cb) again simply replaces the callback. Calling info(false) (or
+     * info()) tears the info subsystem down completely, returning the socket to its
+     * dormant state.
+     *
+     * @param {boolean} [enabled=false] - Whether info updates should be active
+     * @param {?function} [infoCallback] - Called with info report objects while enabled.
+     *                                     Omit (undefined) to keep the current callback,
+     *                                     e.g. when only triggering a probe.
+     *                                     Report content is defined in ToolSocketInfo.js.
+     * @param {?Object} [options] - Additional actions:
+     * @param {string} [options.name] - Assigns a name to this connection (e.g. the
+     *                                  user name the server identified it with);
+     *                                  included in every report as data.name
+     * @param {boolean} [options.probe] - If true, runs a one-shot throughput probe
+     *                                    (max upstream/downstream measurement). The
+     *                                    result is included in every report's
+     *                                    data.probe until the next probe replaces it.
+     *                                    Intended to be triggered by a UI button.
+     * @param {number} [options.probeSizeBytes] - Probe payload size per direction
+     *                                            (default 256 KB, capped at 4 MB)
+     */
+    info(enabled = false, infoCallback, options) {
+        if (enabled) {
+            if (!this.infoHandler) {
+                // Lazy require: this module is only ever loaded once info mode is activated
+                const ToolSocketInfo = require('./ToolSocketInfo.js');
+                this.infoHandler = new ToolSocketInfo(this);
+            }
+            if (infoCallback !== undefined) {
+                this.infoHandler.setCallback(infoCallback);
+            }
+            this.infoHandler.start();
+            if (options && typeof options.name === 'string') {
+                this.infoHandler.setName(options.name);
+            } else if (this.announcedInfoName) {
+                // name announced by the remote end (infoName()); re-applied on every
+                // enable, so it survives the auto-enable/disable subscriber cycles
+                this.infoHandler.setName(this.announcedInfoName);
+            }
+            if (options && options.probe) {
+                this.infoHandler.startProbe(options.probeSizeBytes);
+            }
+        } else if (this.infoHandler) {
+            this.infoHandler.stop();
+            this.infoHandler = null;
+        }
     }
 
     /**
