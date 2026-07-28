@@ -91,7 +91,7 @@ const MB = 1024 * 1024;
 const CLASS_FORMATS = {
     2: ['htm', 'html', 'js', 'css', 'csv', 'dat', 'xml', 'woff', 'webp'],
     3: ['jpeg', 'jpg', 'gif', 'png', 'svg', 'ttf', 'otf', 'pdf'],
-    4: ['3dt', 'fbx', 'glb', 'map', 'mp4', 'obj', 'wasm', 'webm', 'zip'], // also DEFAULTS.defaultBinaryClass for unknown types
+    4: ['3dt', 'fbx', 'glb', 'map', 'mp4', 'ms4', 'obj', 'wasm', 'webm', 'zip'], // also DEFAULTS.defaultBinaryClass for unknown types
     5: ['rad', 'radc', 'splat', 'ply', 'pvs', 'pvz']                      // bulk: sent only when nothing else is queued
 };
 // Derived flat lookup (extension -> class). Kept reference-stable so code holding
