@@ -814,7 +814,14 @@ function enhance(ts, userOpts = {}) {
             }
         }
     }, 10000);
+    // unref() keeps the timer from holding the process open, but it stays in
+    // the timer list - a GC root - so without this the interval's closure
+    // pins nb/sched/opts and the whole socket forever. Guarded exactly like
+    // the pressure entry above: an auto-reconnecting outgoing socket keeps
+    // its gc timer across reconnects, while an incoming socket (url === null)
+    // never comes back and must release it.
     if (gc.unref) gc.unref();
+    ts.addEventListener('close', () => { if (!(opts.reconnect && ts.url)) clearInterval(gc); });
 
     // ---------- public backpressure / flow-control API ----------
     ts.getBackpressure = () => sched.stats();
