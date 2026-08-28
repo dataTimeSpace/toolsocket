@@ -160,4 +160,29 @@ describe('ToolSocket', () => {
 
         toolSocket.message('test/binary', { message: 'Binary data' }, null, [binaryData1, binaryData2]);
     });
+
+    test('a closed parallel socket stops being tracked by its parent', (done) => {
+        const parallel = ToolSocket.makeParallelSocket(toolSocket);
+
+        parallel.addEventListener('open', () => {
+            try {
+                expect(toolSocket.parallelSockets).toContain(parallel);
+            } catch (error) {
+                done(error);
+                return;
+            }
+            parallel.close();
+        });
+
+        parallel.addEventListener('close', () => {
+            try {
+                // Parallels are one-shot, so a list that only ever grew pinned the
+                // whole socket (and its ping timer) once per proxied request
+                expect(toolSocket.parallelSockets).not.toContain(parallel);
+                done();
+            } catch (error) {
+                done(error);
+            }
+        });
+    });
 });
