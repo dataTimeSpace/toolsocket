@@ -823,6 +823,22 @@ class ToolSocket {
         // infoName() keeps the children in sync if the parent is named later
         if (!toolsocket.parallelSockets) toolsocket.parallelSockets = [];
         toolsocket.parallelSockets.push(parallel);
+        // Stop tracking a parallel once it closes. Most parallels are one-shot (the
+        // proxy closes them after a single request), so a list that only ever grew
+        // pinned a ToolSocket, its WebSocket, Sender, Receiver and ping Timeout per
+        // request for the life of the process. A parallel that reconnects re-registers
+        // itself on 'open', mirroring how the NB layer gates its own teardown.
+        parallel.addEventListener('close', () => {
+            const index = toolsocket.parallelSockets.indexOf(parallel);
+            if (index > -1) {
+                toolsocket.parallelSockets.splice(index, 1);
+            }
+        });
+        parallel.addEventListener('open', () => {
+            if (!toolsocket.parallelSockets.includes(parallel)) {
+                toolsocket.parallelSockets.push(parallel);
+            }
+        });
         if (toolsocket.remoteInfoName) {
             parallel.infoName(toolsocket.remoteInfoName + ' · data');
         }
