@@ -64,7 +64,7 @@ describe('MessageBundle', () => {
         const binaryBuffer = new BinaryBuffer(2);
         binaryBuffer.mainMessage = message;
         binaryBuffer.push(binaryData);
-        expect(() => MessageBundle.fromBinaryBuffer(binaryBuffer)).toThrowError(
+        expect(() => MessageBundle.fromBinaryBuffer(binaryBuffer)).toThrow(
             'Cannot create a MessageBundle from a BinaryBuffer that is not full.'
         );
     });
