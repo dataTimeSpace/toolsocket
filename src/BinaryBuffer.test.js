@@ -31,7 +31,7 @@ describe('BinaryBuffer', () => {
         binaryBuffer.push(message);
         binaryBuffer.push(message);
         binaryBuffer.push(message);
-        expect(() => binaryBuffer.push(message)).toThrowError(
+        expect(() => binaryBuffer.push(message)).toThrow(
             'Cannot append more data to BinaryBuffer, length exceeded.'
         );
     });
