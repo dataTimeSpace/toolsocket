@@ -56,6 +56,33 @@ class MessageBundle {
      * @param {Uint8Array} binary - The binary message to convert into a MessageBundle
      * @returns {MessageBundle} - The created MessageBundle
      */
+    /**
+     * Cheap test whether a binary frame is an ENVELOPED message (4-byte length + JSON envelope
+     * + payload) carrying a session sequence number, without building the bundle. Used to tell
+     * such a message from the raw, unenveloped frames of a multi-frame transfer.
+     * @param {Uint8Array} binary
+     * @return {?number} the envelope's `q`, or null if this is not a sequenced envelope
+     */
+    static peekSequence(binary) {
+        try {
+            if (!binary || binary.length < 8) {
+                return null;
+            }
+            const length = byteToInt(binary.slice(0, 4));
+            if (!(length >= 2) || length > binary.length - 4 || length > 4 * 1024 * 1024) {
+                return null;
+            }
+            if (binary[4] !== 123 || binary[3 + length] !== 125) { // '{' ... '}'
+                return null;
+            }
+            const envelope = JSON.parse(decoder.decode(binary.slice(4, length + 4)));
+            return (envelope && typeof envelope.q === 'number' && typeof envelope.m === 'string' &&
+                typeof envelope.r === 'string') ? envelope.q : null;
+        } catch (_e) {
+            return null;
+        }
+    }
+
     static fromBinary(binary) {
         const bufferLength = byteToInt(binary.slice(0, 4));
         const message = ToolSocketMessage.fromString(decoder.decode(binary.slice(4, bufferLength + 4)));
