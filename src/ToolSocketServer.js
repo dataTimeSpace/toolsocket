@@ -63,7 +63,7 @@ class ToolSocketServer {
                 if (existing && existing.__ssn.peer === true && !existing.__ssn.userClosed &&
                     migration.gen >= existing.__ssn.gen) {
                     existing.__ssn.gen = migration.gen;
-                    existing._adoptSocket(socket, migration.w);
+                    existing._adoptSocket(socket, migration.w, migration.c);
                     return;
                 }
             }
@@ -75,9 +75,11 @@ class ToolSocketServer {
                 // grace expired): hand it this fresh one and say so, so it re-arms itself
                 toolSocket.__ssn.id = migration.id;
                 toolSocket.__ssn.gen = migration.gen;
+                // no hello follows on this path: the client's version comes with the URL
+                toolSocket.__ssn.peerVersion = migration.v >= 2 ? migration.v : 1;
                 toolSocket.__ssn.markCapable();
                 this._registerSession(toolSocket);
-                toolSocket._sendControl('__ts/session-ack', { w: 0, reset: true });
+                toolSocket._sendControl('__ts/session-ack', { w: 0, reset: true, v: toolSocket.__ssn.constructor.VERSION });
             }
             this.triggerEvent('connection', toolSocket);
 
@@ -216,15 +218,26 @@ class ToolSocketServer {
     /**
      * Reads a session migration request out of the upgrade URL.
      * @param {?http.IncomingMessage} request
-     * @return {?{id: string, gen: number, w: number}}
+     * @return {?{id: string, gen: number, w: number, c: ?number}} c = migrations the client completed (tsc), null from a v1 client
      */
     _parseMigration(request) {
         if (!request || typeof request.url !== 'string' || request.url.indexOf('tsm=') === -1) {
             return null;
         }
         let value;
+        let completed = null;
+        let version = 1;
         try {
-            value = new URL(request.url, 'ws://localhost').searchParams.get('tsm');
+            const params = new URL(request.url, 'ws://localhost').searchParams;
+            value = params.get('tsm');
+            const tsc = params.get('tsc');
+            if (tsc !== null && /^\d{1,9}$/.test(tsc)) {
+                completed = parseInt(tsc, 10);
+            }
+            const tsv = params.get('tsv');
+            if (tsv !== null && /^\d{1,3}$/.test(tsv)) {
+                version = parseInt(tsv, 10);
+            }
         } catch (_e) {
             return null;
         }
@@ -235,7 +248,7 @@ class ToolSocketServer {
         if (!match) {
             return null;
         }
-        return { id: match[1], gen: parseInt(match[2], 10), w: parseInt(match[3], 10) };
+        return { id: match[1], gen: parseInt(match[2], 10), w: parseInt(match[3], 10), c: completed, v: version };
     }
 
     /**

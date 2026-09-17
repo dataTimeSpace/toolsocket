@@ -168,6 +168,12 @@ class ToolSocket {
             const ssn = this.__ssn;
             target = new URL(String(this.url));
             target.searchParams.set('tsm', `${ssn.id}.${ssn.gen}.${ssn.rx.lastDelivered}`);
+            // migrations this end COMPLETED: lets the server tell a working way down from a
+            // client that merely keeps retrying (a separate parameter — v1 servers ignore it)
+            target.searchParams.set('tsc', String(ssn.completed));
+            // our protocol version: if the server lost the session it builds a fresh one from
+            // this URL alone (no hello follows), and must still know how strict we are
+            target.searchParams.set('tsv', String(SessionStream.VERSION));
         }
         this.socket = new WebSocketWrapper(target, [], {
             maxPayload: MAX_MESSAGE_SIZE,
@@ -187,6 +193,7 @@ class ToolSocket {
             onStall: (reason) => this._onSessionStall(reason)
         }, options);
         this._migration = null;
+        this.binaryBuffer = null;
     }
 
     /**
@@ -270,12 +277,26 @@ class ToolSocket {
      * @param {?function} [callback] - Node ws send-completion callback (NB pacing)
      */
     _writeFrame(frame, seq, callback) {
-        if (callback) {
-            this.socket.send(frame, callback);
-        } else {
-            this.socket.send(frame);
-        }
+        // retained FIRST: if the write throws (transport closed under us) the frame is still
+        // resent on the successor, and a multi-frame unit can never be retained half
+        const ws = this.socket;
         this.__ssn.retain(frame, seq);
+        const retained = seq !== null && seq !== undefined && this.__ssn.active();
+        try {
+            if (callback) {
+                ws.send(frame, callback);
+            } else {
+                ws.send(frame);
+            }
+        } catch (e) {
+            if (!retained) {
+                throw e; // unsequenced / legacy peer: exactly the old behaviour
+            }
+            // the transport closed under us: the frame is retained and goes out on the successor
+            if (callback) {
+                callback(e);
+            }
+        }
     }
 
     /**
@@ -306,6 +327,88 @@ class ToolSocket {
                 this.socket.send(frame);
             } catch (_e) { /* transport died again: its close handler retries */ }
         }
+    }
+
+    /**
+     * The peer reports a hole right above its watermark while later frames reached it: a
+     * middlebox dropped a frame and kept the flow. Resend from the watermark on this same
+     * transport — it works, so there is nothing to migrate away from.
+     * @param {number} w - the peer's watermark
+     * @param {boolean} [reminder] - the peer is repeating an earlier report (ours, or the skip
+     *     that answered it, may have been lost): answer again, but it is no new evidence
+     */
+    _onSessionGap(w, reminder) {
+        const ssn = this.__ssn;
+        if (this._migration || !this._rawOpen()) {
+            return; // a successor's handshake carries the watermark and resends anyway
+        }
+        const verdict = ssn.noteGap(w, reminder);
+        if (verdict === false) {
+            return;
+        }
+        if (verdict) {
+            this._giveUpFrame(verdict);
+        }
+        this._skipUnheld();
+        this._resendRetained(ssn.tx.acked);
+        ssn.resumeStallTimer(); // resent just now: measure the stall deadline from here
+    }
+
+    /**
+     * Tells the peer to stop waiting for numbers this end holds no frame for (given up, or
+     * stamped and never written). Runs on every gap report and every migration handshake,
+     * right after the peer's watermark was applied and before the resend — so a skip that
+     * was lost with its transport is simply sent again, and the peer can never be left
+     * waiting for a frame that does not exist.
+     */
+    _skipUnheld() {
+        const ssn = this.__ssn;
+        if (ssn.peer !== true) {
+            return;
+        }
+        // sent to every session peer, whatever version we believe it to be: a v1 peer merely
+        // logs an unknown route, while a strict peer we misjudged would otherwise wait forever
+        const to = ssn.unheldAbove(ssn.tx.acked);
+        if (to !== null) {
+            this._sendControl('__ts/skip', { to });
+        }
+    }
+
+    /**
+     * One frame cannot be delivered although the transport demonstrably works. Holding the
+     * stream behind it forever (or migrating forever) would silently block every later
+     * message, so the loss is made loud instead: the application is told which message it
+     * was, the peer is told to stop waiting for it, and the stream continues.
+     * @param {{seq: number, frames: Array, reason: string, attempts: number}} given
+     */
+    _giveUpFrame(given) {
+        const info = { seq: given.seq, reason: given.reason, attempts: given.attempts, bytes: 0 };
+        for (const frame of given.frames) {
+            info.bytes += (typeof frame === 'string') ? frame.length : (frame.byteLength || frame.length || 0);
+        }
+        try {
+            const head = given.frames[0];
+            const envelope = (typeof head === 'string') ? JSON.parse(head) : MessageBundle.fromBinary(head).message;
+            if (envelope) {
+                info.method = envelope.m;
+                info.route = envelope.r;
+                info.id = envelope.i;
+                if (envelope.b && typeof envelope.b === 'object' && typeof envelope.b.t === 'string') {
+                    info.tid = envelope.b.t; // NB transfer this frame belonged to (see ToolSocketNB)
+                }
+            }
+        } catch (_e) { /* unparseable head frame: size and sequence are all we know */ }
+        if (info.id && this.responseCallbacks[info.id]) {
+            delete this.responseCallbacks[info.id]; // the request never left: no response will come
+        }
+        console.error(`ToolSocket session: message undeliverable (${info.reason}, ${info.attempts} attempts): ` +
+            `${info.method || '?'} ${info.route || '?'} (${info.bytes} bytes)`);
+        try {
+            this.triggerEvent('undeliverable', info);
+        } catch (e) {
+            console.error('ToolSocket: an "undeliverable" listener threw', e);
+        }
+        // the peer is told by _skipUnheld(), which every caller runs next
     }
 
     /**
@@ -383,7 +486,7 @@ class ToolSocket {
         // Fresh session: announce it before anything else goes out, so the peer can re-bind
         // it later. A legacy peer ignores the unknown meta route and never answers.
         if (this.__ssn.active() && !this.__ssn.serverSide) {
-            this._sendControl('__ts/session', { id: this.__ssn.id, g: this.__ssn.gen, w: this.__ssn.rx.lastDelivered });
+            this._sendControl('__ts/session', { id: this.__ssn.id, g: this.__ssn.gen, w: this.__ssn.rx.lastDelivered, v: SessionStream.VERSION });
             this.__ssn.armPeerTimeout();
         }
         this._surfaceOpen(event);
@@ -465,8 +568,9 @@ class ToolSocket {
      * queued meanwhile — all before the first new sequenced frame (the ping) may go out.
      * @param {WebSocket} ws - the already-open successor
      * @param {number} peerW - highest sequence the client reports having delivered
+     * @param {?number} [peerCompleted] - migrations the client COMPLETED so far (tsc)
      */
-    _adoptSocket(ws, peerW) {
+    _adoptSocket(ws, peerW, peerCompleted) {
         const ssn = this.__ssn;
         ssn.clearGrace();
         if (this.socket) {
@@ -474,8 +578,18 @@ class ToolSocket {
         }
         this.socket = ws;
         this.configureSocket({ deferPing: true });
+        this._transportAttached();
         ssn.onAck(peerW);
-        this._sendControl('__ts/session-ack', { w: ssn.rx.lastDelivered });
+        this._sendControl('__ts/session-ack', { w: ssn.rx.lastDelivered, v: SessionStream.VERSION });
+        // An adoption by itself proves nothing about the way DOWN to the client (it may be
+        // retrying into a dead downstream). Only when the client reports that it completed
+        // the previous migration did our session-ack — and so the resend right behind it on
+        // the same ordered transport — demonstrably have a working path.
+        if (typeof peerCompleted === 'number' && peerCompleted > ssn.peerCompleted) {
+            ssn.peerCompleted = peerCompleted;
+            this._giveUpIfCarriedTooOften();
+        }
+        this._skipUnheld();
         this._resendRetained(peerW);
         ssn.resumeStallTimer();
         this.sendQueuedMessages();
@@ -587,12 +701,37 @@ class ToolSocket {
         this._cancelMigrationTimers();
         this._migration = null;
         ssn.markCapable();
+        ssn.completed++; // reported to the server with the next successor (tsc)
+        this._transportAttached();
         ssn.onAck(w);
+        this._giveUpIfCarriedTooOften();
+        this._skipUnheld();
         this._resendRetained(w);
         ssn.resumeStallTimer();
         this.sendQueuedMessages();
         this.setupPingInterval();
         this.triggerEvent('__ts:migrated', { gen: ssn.gen });
+    }
+
+    /**
+     * Called once per completed migration, after the peer's watermark was applied and before
+     * the resend: a frame that is still the oldest unacked one after several working
+     * transports is what keeps killing them. Without this the session would migrate forever
+     * with every later message stuck behind that frame.
+     */
+    _giveUpIfCarriedTooOften() {
+        const given = this.__ssn.noteCarried();
+        if (given) {
+            this._giveUpFrame(given);
+        }
+    }
+
+    /** A fresh transport carries the session from here: half-received units of the old one are void. */
+    _transportAttached() {
+        this.__ssn.onTransportAttached();
+        if (this.__ssn.takePartialDrop()) {
+            this.binaryBuffer = null;
+        }
     }
 
     /**
@@ -606,11 +745,12 @@ class ToolSocket {
         }
         ssn.id = body.id.slice(0, 64);
         ssn.gen = typeof body.g === 'number' ? body.g : 0;
+        ssn.peerVersion = (typeof body.v === 'number' && body.v >= 2) ? body.v : 1;
         ssn.markCapable();
         if (this.server && this.server._registerSession) {
             this.server._registerSession(this);
         }
-        this._sendControl('__ts/session-ack', { w: ssn.rx.lastDelivered });
+        this._sendControl('__ts/session-ack', { w: ssn.rx.lastDelivered, v: SessionStream.VERSION });
     }
 
     /**
@@ -623,6 +763,9 @@ class ToolSocket {
         if (ssn.serverSide) {
             return;
         }
+        if (body && typeof body.v === 'number') {
+            ssn.peerVersion = body.v >= 2 ? body.v : 1;
+        }
         if (!this._migration) {
             ssn.markCapable();
             return;
@@ -632,10 +775,8 @@ class ToolSocket {
             // sees what it would see on any reconnect — close, then open — and re-arms itself
             this._cancelMigrationTimers();
             this._migration = null;
-            ssn.releaseRetained();
-            ssn.tx.seq = 0;
-            ssn.tx.acked = 0;
-            ssn.rx.lastDelivered = 0;
+            ssn.resetStreams(body && typeof body.v === 'number' ? body.v : 1);
+            this.binaryBuffer = null; // a unit half-received on the old session is void
             ssn.markCapable();
             this._surfaceClose({ code: 1006, reason: 'session-reset', wasClean: false });
             this._surfaceOpen({});
@@ -770,7 +911,18 @@ class ToolSocket {
                 this._onSessionAck(body);
             } else if (route === '__ts/ack') {
                 if (body && typeof body.w === 'number') {
-                    this.__ssn.onAck(body.w);
+                    if (body.g) {
+                        this._onSessionGap(body.w, body.g === 2); // watermark + "the next frame never came"
+                    } else {
+                        this.__ssn.onAck(body.w, body.p);
+                    }
+                }
+            } else if (route === '__ts/skip') {
+                if (body && typeof body.to === 'number') {
+                    this.__ssn.onSkip(body.to);
+                    if (this.__ssn.takePartialDrop()) {
+                        this.binaryBuffer = null;
+                    }
                 }
             } else if (route === '__ts/bye') {
                 // the peer is closing through its toolsocket API: the coming close is final
@@ -839,6 +991,7 @@ class ToolSocket {
                 if (!isCurrent()) {
                     return;
                 }
+                this.__ssn.noteInbound(); // whatever it is: THIS transport delivers
                 this.triggerEvent('rawMessage', event.data);
                 if (typeof event.data === 'string') {
                     this.routeMessage(event.data);
@@ -916,8 +1069,12 @@ class ToolSocket {
                 messageBundle = MessageBundle.fromString(message);
                 messageLength = message.length;
                 if (messageBundle.message.frameCount !== null) {
-                    if (!this.__ssn.onInbound(messageBundle.message)) {
-                        return; // duplicate transfer header: its raw frames are skipped too
+                    const accepted = this.__ssn.onInbound(messageBundle.message);
+                    if (this.__ssn.takePartialDrop()) {
+                        this.binaryBuffer = null; // a half-received unit was abandoned
+                    }
+                    if (!accepted) {
+                        return; // duplicate or out-of-order transfer header: its raw frames are skipped too
                     }
                     // frameCount is the number of binary messages to follow
                     // Set up this.binaryBuffer so that we can receive those messages
@@ -930,14 +1087,16 @@ class ToolSocket {
                 this.triggerEvent('droppedMessage', message);
                 return;
             }
-        } else if (this.binaryBuffer) {
+        } else if (this.binaryBuffer && this._isRawFrameOfPendingUnit(message)) {
             // Part of a sequence of broken up binary messages
             // Append messages one at a time to the buffer until message length is reached
             this.binaryBuffer.push(message);
+            this.__ssn.unitProgress();
             if (!this.binaryBuffer.isFull) {
                 return;
             }
-            // We can now process the full buffer
+            // We can now process the full buffer: only now does the unit count as delivered
+            this.__ssn.completeGroup();
             try {
                 messageBundle = MessageBundle.fromBinaryBuffer(this.binaryBuffer);
                 messageLength = message.length;
@@ -973,7 +1132,11 @@ class ToolSocket {
 
         // Session layer: exactly-once, in-order delivery of sequenced frames; the hop-local
         // sequence is consumed here and never reaches the application or a relay.
-        if (!this.__ssn.onInbound(messageBundle.message)) {
+        const deliver = this.__ssn.onInbound(messageBundle.message);
+        if (this.__ssn.takePartialDrop()) {
+            this.binaryBuffer = null; // a raw frame of the unit before this one never came
+        }
+        if (!deliver) {
             return;
         }
 
@@ -992,13 +1155,38 @@ class ToolSocket {
     }
 
     /**
+     * While a multi-frame unit is being received, every binary frame is one of its raw frames
+     * — unless a raw frame was lost on a live transport and what arrives is already the NEXT
+     * message. A string frame exposes that by itself (it is sequenced); an enveloped binary
+     * message must be recognised here, or it would be swallowed into the unit, which would
+     * then be completed, acknowledged and delivered corrupt.
+     * @param {Uint8Array} message
+     * @return {boolean} false when the unit was abandoned and `message` must be routed normally
+     */
+    _isRawFrameOfPendingUnit(message) {
+        const pendingSeq = this.__ssn.pendingSeq();
+        if (pendingSeq === null) {
+            return true; // no session unit pending (legacy / v1 peer): the old behaviour
+        }
+        const q = MessageBundle.peekSequence(message);
+        if (q === null || q <= pendingSeq) {
+            return true;
+        }
+        this.__ssn.abandonPending();
+        this.binaryBuffer = null;
+        return false; // routed as a message: it is out of order, so the hole gets reported
+    }
+
+    /**
      * Sends messages that were queued up while socket was disconnected
      */
     sendQueuedMessages() {
-        this.queuedMessages.forEach(({messageBundle, callback}) => {
+        // taken out first: a send that throws must not leave already-written bundles queued
+        const queued = this.queuedMessages;
+        this.queuedMessages = [];
+        queued.forEach(({messageBundle, callback}) => {
             this.send(messageBundle, callback);
         });
-        this.queuedMessages = [];
     }
 
     /**
@@ -1022,26 +1210,29 @@ class ToolSocket {
 
         // sequence assigned at write time: the wire order is the sequence order
         const seq = this.__ssn.stamp(messageBundle.message);
-        if (messageBundle.binaryData) {
-            if (Array.isArray(messageBundle.binaryData)) {
+        let frames;
+        try {
+            if (messageBundle.binaryData && Array.isArray(messageBundle.binaryData)) {
                 messageBundle.message.frameCount = messageBundle.binaryData.length;
-                const metaSendData = JSON.stringify(messageBundle.message);
-                this._writeFrame(metaSendData, seq);
-                this.triggerEvent('rawSend', metaSendData);
-                messageBundle.binaryData.forEach(entry => {
-                    const sendData = entry;
-                    this._writeFrame(sendData, seq); // the raw frames ride under the header's sequence
-                    this.triggerEvent('rawSend', sendData);
-                });
+                // the raw frames ride under the header's sequence
+                frames = [JSON.stringify(messageBundle.message), ...messageBundle.binaryData];
+            } else if (messageBundle.binaryData) {
+                frames = [messageBundle.toBinary()];
             } else {
-                const sendData = messageBundle.toBinary();
-                this._writeFrame(sendData, seq);
-                this.triggerEvent('rawSend', sendData);
+                frames = [JSON.stringify(messageBundle.message)];
             }
-        } else {
-            const sendData = JSON.stringify(messageBundle.message);
-            this._writeFrame(sendData, seq);
-            this.triggerEvent('rawSend', sendData);
+        } catch (e) {
+            // an unserializable body: nothing was written, so the number must not be consumed —
+            // a number without a frame is a hole the receiver would wait on
+            this.__ssn.unstampLast(messageBundle.message);
+            if (callback) {
+                delete this.responseCallbacks[messageBundle.message.id];
+            }
+            throw e;
+        }
+        for (const frame of frames) {
+            this._writeFrame(frame, seq);
+            this.triggerEvent('rawSend', frame);
         }
         this.triggerEvent('send', messageBundle);
     }

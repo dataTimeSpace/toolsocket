@@ -246,9 +246,14 @@ class NBScheduler {
             this.queuedBytes -= item.size;
             this.queuedByClass[item.cls] -= item.size;
             let frames;
+            const ssn = this.ts.__ssn || null;
+            if (ssn) ssn.tx.lastStamped = null; // build() sets it iff it stamps; never inherit the previous item's
             try {
                 frames = item.build(); // lazy framing: at most one chunkSize memcpy per turn
             } catch (e) {
+                // stamped, then serialization threw: take the number back — a number that is
+                // never written is a hole the receiver would wait on
+                if (ssn) ssn.unstampLast();
                 console.warn('ToolSocketNB: frame build failed, skipping item', e);
                 defer(step);
                 return;
@@ -256,7 +261,7 @@ class NBScheduler {
             if (!Array.isArray(frames)) frames = [frames];
             // the sequence build() stamped into this item's envelope (null when the session
             // layer is off); every frame of a multi-frame item rides under the same one
-            const seq = this.ts.__ssn ? this.ts.__ssn.tx.lastStamped : null;
+            const seq = ssn ? ssn.tx.lastStamped : null;
             this.maybeLow();
             if (!isBrowser) {
                 let pending = frames.length;
@@ -730,6 +735,24 @@ function enhance(ts, userOpts = {}) {
         ts.triggerEvent('nbTransfer', { phase: 'aborted', tid: body.t });
     });
 
+    // The session layer gave up on one frame of a chunked transfer (see ToolSocket
+    // _giveUpFrame): the transfer can no longer complete. Fail it on both ends instead of
+    // leaving it half-acked — cancel locally, flush its queued chunks, tell the receiver.
+    ts.addEventListener('undeliverable', info => {
+        if (!info || typeof info.route !== 'string' || info.route.indexOf('__tsnb/') !== 0 || !info.tid) return;
+        if (info.route === '__tsnb/abort') return;
+        const tid = info.tid;
+        const snd = nb.sending.get(tid);
+        if (snd) {
+            nb.unackedBytes = Math.max(0, nb.unackedBytes - (snd.unacked || 0));
+            nb.sending.delete(tid);
+        }
+        if (sched.dropByTid) sched.dropByTid(tid);
+        sendInternal('__tsnb/abort', { t: tid }, null, 0);
+        ts.triggerEvent('transferCancelled', { tid, reason: 'undeliverable' });
+        ts.triggerEvent('nbTransfer', { phase: 'aborted', tid });
+    });
+
     nb.forward = sendInternal; // used by streaming relay on the target socket
 
     /** Re-dispatch a reassembled message through the standard ToolSocket API surface. */
@@ -838,7 +861,15 @@ function enhance(ts, userOpts = {}) {
     ts.getBackpressure = () => sched.stats();
     /** Fan-out fast path: enqueue an already-serialized JSON message (class 1).
      *  Build the string once with NB.prepare() and send it to many sockets. */
-    ts.sendPrepared = (str) => sched.enqueue({ cls: 1, size: str.length + 64, build: () => str });
+    // A prepared frame is serialized once for many sockets, so its per-connection sequence is
+    // spliced in at write time. (Left unsequenced it would be retained under whatever number
+    // the previous item had, and lost without a trace across a migration.)
+    ts.sendPrepared = (str) => sched.enqueue({ cls: 1, size: str.length + 64, build: () => {
+        if (!ts.__ssn || typeof str !== 'string' || str.charCodeAt(str.length - 1) !== 125 /* } */) return str;
+        const holder = {};
+        const q = ts.__ssn.stamp(holder);
+        return q === null ? str : str.slice(0, -1) + ',"q":' + q + '}';
+    } });
     ts.pauseSends = (minClass = 2) => { sched.pausedMinClass = minClass; };           // "close the buffer" (JSON keeps flowing by default)
     ts.resumeSends = () => { sched.pausedMinClass = Infinity; sched.pump(); };        // "open the buffer"
     ts.flushQueued = (minClass = 2) => {                                              // discard queued classes >= minClass, abort their transfers
