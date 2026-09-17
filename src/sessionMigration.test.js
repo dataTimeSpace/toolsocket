@@ -234,6 +234,17 @@ describe('session layer', () => {
         expect(srv.server.sessions.has(client.__ssn.id)).toBe(false);
     });
 
+    test('server forgets a session whose listeners were wiped (removeAllListeners) once grace runs out', async () => {
+        const srv = await startServer(5051);
+        const { client } = await connectClient(5051);
+        await waitFor(() => capable(srv, client));
+        const serverSide = srv.connections[0];
+        serverSide.removeAllListeners(); // what the cloud proxy does to a superseded edge socket
+        client.__ssn.userClosed = true;
+        client._unbindSocket({ terminate: true }); // abnormal cut, no successor will come
+        expect(await waitFor(() => !srv.server.sockets.includes(serverSide) && !srv.server.sessions.has(client.__ssn.id), FAST.graceMs * 3)).toBe(true);
+    });
+
     test('explicit close(): immediate, no migration', async () => {
         const srv = await startServer(5047);
         const { client, events } = await connectClient(5047);

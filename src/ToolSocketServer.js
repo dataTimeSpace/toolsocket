@@ -89,30 +89,9 @@ class ToolSocketServer {
                 }
             });
 
-            // Fires once the SESSION is over (a legacy peer's transport close, or a
-            // session-capable peer that found no successor within grace) — after the
-            // application's own 'close' listeners, so the info handler's final report is
-            // already in place.
-            toolSocket.addEventListener('__ts:closed', () => {
-                this._unregisterSession(toolSocket);
-                const index = this.sockets.indexOf(toolSocket);
-                if (index > -1) {
-                    this.sockets.splice(index, 1);
-                }
-                this.infoAutoEnabled.delete(toolSocket);
-                // Keep the connection's final report for remote info subscribers -
-                // closed connections are the main evidence of network-level cuts
-                if (toolSocket.infoHandler && toolSocket.infoHandler.latestReport) {
-                    this.infoClosedReports.push(toolSocket.infoHandler.latestReport);
-                    if (this.infoClosedReports.length > MAX_CLOSED_INFO_REPORTS) {
-                        this.infoClosedReports.shift();
-                    }
-                }
-                // A closing subscriber ends its own subscription
-                if (this.infoSubscribers.has(toolSocket)) {
-                    this.unsubscribeServerInfo(toolSocket);
-                }
-            });
+            // Bookkeeping once the SESSION is over runs through _onSessionClosed, called
+            // directly by the socket (see ToolSocket._surfaceClose) — not through a listener,
+            // which an application could wipe with removeAllListeners().
         });
 
         this.server.on('close', (...args) => {
@@ -257,6 +236,33 @@ class ToolSocketServer {
             return null;
         }
         return { id: match[1], gen: parseInt(match[2], 10), w: parseInt(match[3], 10) };
+    }
+
+    /**
+     * A connection's session is over (a legacy peer's transport close, a deliberate close,
+     * or a session-capable peer that found no successor within grace). Runs after the
+     * application's own 'close' listeners, so the info handler's final report is in place.
+     * @param {IncomingToolSocket} toolSocket
+     */
+    _onSessionClosed(toolSocket) {
+        this._unregisterSession(toolSocket);
+        const index = this.sockets.indexOf(toolSocket);
+        if (index > -1) {
+            this.sockets.splice(index, 1);
+        }
+        this.infoAutoEnabled.delete(toolSocket);
+        // Keep the connection's final report for remote info subscribers -
+        // closed connections are the main evidence of network-level cuts
+        if (toolSocket.infoHandler && toolSocket.infoHandler.latestReport) {
+            this.infoClosedReports.push(toolSocket.infoHandler.latestReport);
+            if (this.infoClosedReports.length > MAX_CLOSED_INFO_REPORTS) {
+                this.infoClosedReports.shift();
+            }
+        }
+        // A closing subscriber ends its own subscription
+        if (this.infoSubscribers.has(toolSocket)) {
+            this.unsubscribeServerInfo(toolSocket);
+        }
     }
 
     _registerSession(toolSocket) {

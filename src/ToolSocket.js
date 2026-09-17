@@ -435,7 +435,13 @@ class ToolSocket {
         this.triggerEvent('close', event);
         this.triggerEvent('disconnect', event);
         this.triggerEvent('status', this.readyState);
-        // internal, after the application's listeners: server-side bookkeeping
+        // internal, after the application's listeners: server-side bookkeeping. A direct
+        // hook rather than an event: an application may wipe a socket's listeners
+        // (removeAllListeners — the cloud proxy does it to a superseded edge socket) and the
+        // server must still forget the session when its grace runs out.
+        if (this.server && this.server._onSessionClosed) {
+            this.server._onSessionClosed(this);
+        }
         this.triggerEvent('__ts:closed', event);
     }
 
