@@ -221,10 +221,14 @@ class ToolSocketServer {
         }
         this.infoSubscribers.clear();
         this.infoAutoEnabled.clear();
-        // shutting down ends every session: no grace, closes surface at once
+        // shutting down ends every session deliberately: tell each peer in-band so it does
+        // not try to migrate, and surface every close at once (no grace)
         for (const toolSocket of this.sockets) {
             toolSocket.__ssn.userClosed = true;
             toolSocket.__ssn.clearGrace();
+            if (toolSocket.__ssn.peer === true) {
+                toolSocket._sendControl('__ts/bye', {});
+            }
         }
         this.sessions.clear();
         this.server.close();

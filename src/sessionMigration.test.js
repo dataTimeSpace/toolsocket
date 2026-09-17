@@ -182,13 +182,49 @@ describe('session layer', () => {
         expect(srv.server.sockets.length).toBe(0);
     });
 
-    test('a departed session-capable client surfaces close only after grace', async () => {
+    test('a client closing through the API ends the session on the server at once', async () => {
+        const srv = await startServer(5049);
+        const { client } = await connectClient(5049);
+        await waitFor(() => capable(srv, client));
+        const t0 = Date.now();
+        client.close(); // __ts/bye goes out first: the server knows this close is deliberate
+        expect(await waitFor(() => srv.closes.length === 1, 1500)).toBe(true);
+        expect(Date.now() - t0).toBeLessThan(FAST.graceMs);
+        expect(srv.server.sessions.has(client.__ssn.id)).toBe(false);
+    });
+
+    test('a clean close injected outside the API (middlebox-style) is a transport loss: migrate, surface nothing', async () => {
+        const srv = await startServer(5050);
+        const { client, events } = await connectClient(5050);
+        await waitFor(() => capable(srv, client));
+        const serverSide = srv.connections[0];
+        const received = [];
+        serverSide.addEventListener('/msg', body => received.push(body.n));
+        // a firewall / zero-trust proxy closing the flow "cleanly" on our behalf: a proper
+        // close frame (1000) arrives at both ends, but nobody called toolsocket's close()
+        client.socket.close(1000, 'middlebox');
+        for (let n = 0; n < 5; n++) {
+            client.emit('/msg', { n }); // queued through the migration, delivered after
+        }
+        expect(await waitFor(() => received.length === 5, 4000)).toBe(true);
+        expect(received).toEqual([0, 1, 2, 3, 4]);
+        expect(events.migrating).toBe(1);
+        expect(events.close).toBe(0);
+        expect(srv.closes.length).toBe(0);
+        expect(srv.connections.length).toBe(1);
+        expect(srv.server.sessions.get(client.__ssn.id)).toBe(serverSide);
+    });
+
+    test('an abnormally cut session-capable client surfaces close only after grace', async () => {
         const srv = await startServer(5046);
         const { client } = await connectClient(5046);
         await waitFor(() => capable(srv, client));
         const serverSide = srv.connections[0];
         const t0 = Date.now();
-        client.close(); // an explicit close on the client never migrates; the server only sees its transport go
+        // the transport dies without a close frame (what a firewall or a crash looks like);
+        // this client is not coming back, but the server cannot know that yet
+        client.__ssn.userClosed = true;
+        client._unbindSocket({ terminate: true });
         await sleep(FAST.graceMs / 2);
         expect(srv.closes.length).toBe(0); // still waiting for a successor
         expect(serverSide.connected).toBe(true); // the session reads open meanwhile

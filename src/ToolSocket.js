@@ -237,8 +237,11 @@ class ToolSocket {
     }
 
     /**
-     * Closes the WebSocket connection. An explicit close ends the session: no migration, no
-     * grace, the 'close' event fires as soon as the transport is gone.
+     * Closes the WebSocket connection. A close through this API ends the session on both
+     * ends: the peer is told so in-band (__ts/bye) before the close frame goes out, so it
+     * surfaces the close at once instead of holding the session for a successor. This is the
+     * ONLY way a session ends deliberately — a close frame that merely shows up on the wire
+     * is treated as a transport loss (see _onTransportClosed).
      */
     close() {
         this.__ssn.userClosed = true;
@@ -246,6 +249,9 @@ class ToolSocket {
         if (this._migration) {
             this._cancelMigrationTimers();
             this._migration = null;
+        }
+        if (this.__ssn.peer === true) {
+            this._sendControl('__ts/bye', {});
         }
         this.socket.close();
     }
@@ -404,7 +410,12 @@ class ToolSocket {
             this._retryMigration('transport-closed');
             return;
         }
-        if (!ssn.userClosed && ssn.peer === true) {
+        // Deliberate only if the peer said so in-band (__ts/bye from its toolsocket close()).
+        // The close frame itself — clean code or not — is NOT trusted: middleboxes close flows
+        // on a peer's behalf, and that is precisely the loss to migrate from (client) or to
+        // hold the session open for a successor through (server).
+        const intentional = ssn.peerClosed === true;
+        if (!ssn.userClosed && ssn.peer === true && !intentional) {
             if (this.url) {
                 this._migrate('transport-closed');
                 return;
@@ -490,6 +501,7 @@ class ToolSocket {
             return;
         }
         m.attempts++;
+        m.opened = false;
         try {
             this._dial(true);
         } catch (_e) {
@@ -527,6 +539,16 @@ class ToolSocket {
         }
         this._cancelMigrationTimers();
         this._unbindSocket({ terminate: true });
+        if (why === 'transport-closed' && !m.opened) {
+            // refused before it even opened: the server is most likely down, not the path.
+            // A few of those in a row and the ordinary reconnect path (with its own backoff)
+            // takes over instead of burning the whole migration budget.
+            m.refusals = (m.refusals || 0) + 1;
+            if (m.refusals >= 3) {
+                this._abandonMigration('refused');
+                return;
+            }
+        }
         if (this.__ssn.userClosed || Date.now() - m.startedAt >= this.__ssn.opts.migrateMaxMs) {
             this._abandonMigration(why);
             return;
@@ -744,6 +766,9 @@ class ToolSocket {
                 if (body && typeof body.w === 'number') {
                     this.__ssn.onAck(body.w);
                 }
+            } else if (route === '__ts/bye') {
+                // the peer is closing through its toolsocket API: the coming close is final
+                this.__ssn.peerClosed = true;
             } else {
                 console.warn(`Received unknown meta route: "${route}"`);
             }

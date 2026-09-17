@@ -124,6 +124,13 @@ class SessionStream {
         /** 'unknown' until the peer answers the session handshake, then true, or false (legacy) */
         this.peer = 'unknown';
         this.userClosed = false;
+        /**
+         * The peer ended the session through ITS toolsocket API (it sent __ts/bye before
+         * closing). Only then is a transport close final. A close frame arriving on its own —
+         * clean code or not — proves nothing: a firewall or zero-trust proxy can tear a flow
+         * down "cleanly" on the peer's behalf, and that is exactly the case to migrate through.
+         */
+        this.peerClosed = false;
         this.migrating = false;
         this.serverSide = false;
 
