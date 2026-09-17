@@ -120,6 +120,11 @@ class ToolSocketMessage {
         const message = new ToolSocketMessage(object.o, object.n, object.m, object.r, object.b, object.i);
         message.s = object.s !== undefined ? object.s : null;
         message.f = object.f !== undefined ? object.f : null;
+        if (typeof object.q === 'number') {
+            // session sequence (see SessionStream.js): only present between session-capable
+            // peers, consumed by the receiving ToolSocket and never exposed further
+            message.q = object.q;
+        }
         return message;
     }
 }
