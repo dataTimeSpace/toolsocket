@@ -341,6 +341,29 @@ describe('SessionStream (unit)', () => {
         stream.dispose();
     });
 
+    test('adapts the stall deadline to observed ack latency, within floor and cap', () => {
+        // production-shaped config: 1s floor, 8s cap, 200ms slack
+        const stream = new SessionStream({ sendControl: () => {}, onStall: () => {} },
+            { migrateAfterMs: 1000, migrateAfterMaxMs: 8000, migrateSlackMs: 200, ackIntervalMs: 5 });
+        stream.peer = true;
+        expect(stream.deadline()).toBe(1000); // floor before any sample
+        const feed = (latencyMs, n) => {
+            for (let i = 0; i < n; i++) {
+                const seq = stream.stamp({});
+                stream.tx.retained.push({ seq, frame: 'x', at: Date.now() - latencyMs });
+                stream.onAck(seq);
+            }
+        };
+        feed(100, 10);                     // fast link (100ms write->ack): stays at the floor
+        expect(stream.deadline()).toBe(1000);
+        feed(2500, 20);                    // a 2.5s delay wave: deadline rises well above it
+        expect(stream.deadline()).toBeGreaterThan(2500);
+        expect(stream.deadline()).toBeLessThanOrEqual(8000);
+        feed(20000, 20);                   // pathological: capped
+        expect(stream.deadline()).toBe(8000);
+        stream.dispose();
+    });
+
     test('mints unguessable session ids', () => {
         const a = SessionStream.secureId(32);
         const b = SessionStream.secureId(32);

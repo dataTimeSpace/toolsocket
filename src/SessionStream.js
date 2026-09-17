@@ -53,7 +53,10 @@ const DEFAULTS = {
     enabled: true,
     ackIntervalMs: 100,           // coalesce watermark acks to at most one per interval...
     ackEveryFrames: 32,           // ...or ack immediately after this many sequenced frames
-    migrateAfterMs: 1000,         // oldest unacked frame older than this => transport presumed dead
+    migrateAfterMs: 1000,         // FLOOR of the stall deadline: oldest unacked frame older than this
+                                  // => transport presumed dead (on a fast link this is the deadline)
+    migrateAfterMaxMs: 8000,      // CAP of the adaptive deadline on a slow-but-alive link
+    migrateSlackMs: 200,          // added to the adaptive estimate (ack coalescing + scheduling)
     sessionTimeoutMs: 5000,       // no session-ack from the peer within this => legacy peer
     graceMs: 16000,               // server keeps a session alive this long waiting for a successor
     migrateMaxMs: 16000,          // client gives up migrating after this long => real close
@@ -148,10 +151,46 @@ class SessionStream {
             skipBinary: 0      // legacy frameCount transfer: raw frames to drop after a duplicate header
         };
 
+        /**
+         * Observed write->ack latency (Jacobson/Karels smoothing, like TCP's RTO). The stall
+         * deadline adapts to it: a queueing-heavy but alive link (zero-trust tunnel under
+         * load, a 3s delay wave) raises the deadline instead of triggering a migration on
+         * every frame, while a fast link keeps the 1s floor.
+         */
+        this.rtt = { srtt: null, rttvar: null, samples: 0 };
+
         this.stallTimer = null;
         this.peerTimer = null;
         this.graceTimer = null;
         this.disposed = false;
+    }
+
+    /**
+     * Current stall deadline: max(floor, srtt + 4*rttvar + slack), capped.
+     * @return {number} milliseconds
+     */
+    deadline() {
+        const o = this.opts;
+        if (this.rtt.srtt === null) {
+            return o.migrateAfterMs;
+        }
+        const adaptive = this.rtt.srtt + 4 * this.rtt.rttvar + o.migrateSlackMs;
+        return Math.min(o.migrateAfterMaxMs, Math.max(o.migrateAfterMs, adaptive));
+    }
+
+    _sampleRtt(sample) {
+        if (!(sample >= 0)) {
+            return;
+        }
+        const r = this.rtt;
+        if (r.srtt === null) {
+            r.srtt = sample;
+            r.rttvar = sample / 2;
+        } else {
+            r.rttvar = 0.75 * r.rttvar + 0.25 * Math.abs(r.srtt - sample);
+            r.srtt = 0.875 * r.srtt + 0.125 * sample;
+        }
+        r.samples++;
     }
 
     // ---------- capability ----------
@@ -251,6 +290,9 @@ class SessionStream {
             dropped++;
         }
         if (dropped > 0) {
+            // write->ack latency of the newest frame this ack covers: one ack interval plus
+            // the round trip, which is what the stall deadline must stay comfortably above
+            this._sampleRtt(Date.now() - retained[dropped - 1].at);
             retained.splice(0, dropped);
         }
         if (retained.length === 0) {
@@ -278,14 +320,14 @@ class SessionStream {
             return;
         }
         const oldest = this.tx.retained[0];
-        const due = Math.max(0, this.opts.migrateAfterMs - (Date.now() - oldest.at));
+        const due = Math.max(0, this.deadline() - (Date.now() - oldest.at));
         this.stallTimer = unref(setTimeout(() => {
             this.stallTimer = null;
             if (!this.active() || this.tx.retained.length === 0) {
                 return;
             }
             const age = Date.now() - this.tx.retained[0].at;
-            if (age >= this.opts.migrateAfterMs) {
+            if (age >= this.deadline()) {
                 this.io.onStall('ack-timeout');
             } else {
                 this.armStallTimer();
