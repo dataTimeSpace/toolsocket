@@ -227,8 +227,10 @@ class NBScheduler {
         this.draining = true;
         const step = () => {
             const sock = this.ts.socket;
-            if (!sock || this.ts.readyState !== 1 /* OPEN */) {
-                this.draining = false; // resumes via 'open' listener
+            // raw transport state, not the session's: during a migration the session reads
+            // OPEN while nothing sequenced may be written yet
+            if (!sock || !this.ts._transportOpen()) {
+                this.draining = false; // resumes via the 'open' / '__ts:migrated' listeners
                 return;
             }
             if (sock.bufferedAmount > this.opts.lowWater) {
@@ -252,15 +254,18 @@ class NBScheduler {
                 return;
             }
             if (!Array.isArray(frames)) frames = [frames];
+            // the sequence build() stamped into this item's envelope (null when the session
+            // layer is off); every frame of a multi-frame item rides under the same one
+            const seq = this.ts.__ssn ? this.ts.__ssn.tx.lastStamped : null;
             this.maybeLow();
             if (!isBrowser) {
                 let pending = frames.length;
                 const next = () => { if (--pending === 0) defer(step); };
                 for (const f of frames) {
-                    try { sock.send(f, next); } catch (_e) { next(); }
+                    try { this.ts._writeFrame(f, seq, next); } catch (_e) { next(); }
                 }
             } else {
-                for (const f of frames) { try { sock.send(f); } catch (_e) { /* closed */ } }
+                for (const f of frames) { try { this.ts._writeFrame(f, seq); } catch (_e) { /* closed */ } }
                 setTimeout(step, 0); // browsers: pace via bufferedAmount check above
             }
         };
@@ -434,8 +439,11 @@ function enhance(ts, userOpts = {}) {
 
     const mkMsg = (method, route, body, id = null) =>
         new ToolSocketMessage(ts.origin, ts.networkId, method, route, body, id);
+    // frames are built lazily in the scheduler right before they are written, which is the
+    // one moment a session sequence may be assigned (wire order == sequence order)
+    const stamp = (message) => { if (ts.__ssn) ts.__ssn.stamp(message); return message; };
     const frameFor = (message, bin) =>
-        bin ? new MessageBundle(message, bin).toBinary() : JSON.stringify(message);
+        bin ? new MessageBundle(stamp(message), bin).toBinary() : JSON.stringify(stamp(message));
     const sendInternal = (route, body, bin, cls) => {
         sched.enqueue({
             cls, size: (bin ? bin.length : 0) + 64, tid: body && body.t,
@@ -471,14 +479,14 @@ function enhance(ts, userOpts = {}) {
                 cls, size,
                 build: () => {
                     bundle.message.frameCount = bin.length;
-                    return [JSON.stringify(bundle.message), ...bin];
+                    return [JSON.stringify(stamp(bundle.message)), ...bin];
                 }
             });
             return;
         }
         sched.enqueue({
             cls, size: bin ? bin.length + 128 : 200,
-            build: () => bin ? bundle.toBinary() : JSON.stringify(bundle.message)
+            build: () => { stamp(bundle.message); return bin ? bundle.toBinary() : JSON.stringify(bundle.message); }
         });
     }
 
@@ -762,6 +770,9 @@ function enhance(ts, userOpts = {}) {
     };
     tuneSocket();
     ts.addEventListener('open', () => { nb.reconnectDelay = 500; sendHello(); armHelloTimeout(); tuneSocket(); sched.pump(); });
+    // the session moved to a fresh transport underneath us (no 'close'/'open' fired): same
+    // peer, same capability, same transfers — just tune the new raw socket and keep pumping
+    ts.addEventListener('__ts:migrated', () => { tuneSocket(); sched.pump(); });
 
     // enroll in the process-wide pressure registry (Node only)
     {
