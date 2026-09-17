@@ -8,11 +8,16 @@ class IncomingToolSocket extends ToolSocket {
      * @param {ToolSocketServer} server - The ToolSocketServer this is attached to.
      */
     constructor(websocket, server) {
-        super();
+        // the server's session options reach the SessionStream through the wsOptions slot
+        super(undefined, undefined, undefined, { session: server.sessionOptions || undefined });
         this.socket = websocket;
         this.networkId = 'toolbox'; // Or 'io'?
         this.origin = server.origin;
         this.server = server;
+        // server-side sessions are adopted from the client's announcement; a client that
+        // never announces one (older toolsocket) is treated as legacy after the timeout
+        this.__ssn.serverSide = true;
+        this.__ssn.armPeerTimeout();
 
         /**
          * Lazy-initialized info handler (see info()). Stays null while info mode is off,

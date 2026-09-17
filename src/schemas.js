@@ -113,6 +113,14 @@ const MESSAGE_BUNDLE_SCHEMA = new Schema([
         }),
         new Schema.NullValidator('f'),
         new Schema.UndefinedValidator('f')
+    ]),
+    // Session sequence (see SessionStream.js): present only between session-capable peers
+    new Schema.GroupValidator('q', [
+        new Schema.NumberValidator('q', {
+            minValue: 1,
+            maxValue: Number.MAX_SAFE_INTEGER
+        }),
+        new Schema.UndefinedValidator('q')
     ])
 ]);
 
