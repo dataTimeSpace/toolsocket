@@ -17,7 +17,14 @@ class ToolSocketServer {
      */
     constructor(options, origin) {
         this.origin = origin || 'server';
-        this.server = new WebSocketWrapper.Server(options);
+        // `session` configures the per-connection session layer (see SessionStream.js) and is
+        // not a WebSocket.Server option
+        const { session: sessionOptions, ...serverOptions } = options || {};
+        this.sessionOptions = sessionOptions || null;
+        this.server = new WebSocketWrapper.Server(serverOptions);
+
+        /** live sessions by id: a successor transport re-binds to the same IncomingToolSocket */
+        this.sessions = new Map();
 
         /** @type [ToolSocket] */
         this.sockets = [];
@@ -45,9 +52,33 @@ class ToolSocketServer {
             this.triggerEvent('listening', ...args);
         });
 
-        this.server.on('connection', socket => {
+        this.server.on('connection', (socket, request) => {
+            // A successor transport for a live session names it in the URL (see
+            // ToolSocket._dial): re-bind the SAME IncomingToolSocket to it. No instance is
+            // created and no event fires — the application keeps its socket, subscriptions,
+            // callbacks and identity.
+            const migration = this._parseMigration(request);
+            if (migration) {
+                const existing = this.sessions.get(migration.id);
+                if (existing && existing.__ssn.peer === true && !existing.__ssn.userClosed &&
+                    migration.gen >= existing.__ssn.gen) {
+                    existing.__ssn.gen = migration.gen;
+                    existing._adoptSocket(socket, migration.w);
+                    return;
+                }
+            }
+
             const toolSocket = new IncomingToolSocket(socket, this);
             this.sockets.push(toolSocket);
+            if (migration) {
+                // the client tried to carry a session this server no longer has (restart,
+                // grace expired): hand it this fresh one and say so, so it re-arms itself
+                toolSocket.__ssn.id = migration.id;
+                toolSocket.__ssn.gen = migration.gen;
+                toolSocket.__ssn.markCapable();
+                this._registerSession(toolSocket);
+                toolSocket._sendControl('__ts/session-ack', { w: 0, reset: true });
+            }
             this.triggerEvent('connection', toolSocket);
 
             toolSocket.on('confirmParallel', id => {
@@ -58,11 +89,18 @@ class ToolSocketServer {
                 }
             });
 
-            socket.on('close', () => {
-                this.sockets.splice(this.sockets.indexOf(toolSocket), 1);
+            // Fires once the SESSION is over (a legacy peer's transport close, or a
+            // session-capable peer that found no successor within grace) — after the
+            // application's own 'close' listeners, so the info handler's final report is
+            // already in place.
+            toolSocket.addEventListener('__ts:closed', () => {
+                this._unregisterSession(toolSocket);
+                const index = this.sockets.indexOf(toolSocket);
+                if (index > -1) {
+                    this.sockets.splice(index, 1);
+                }
                 this.infoAutoEnabled.delete(toolSocket);
-                // Keep the connection's final report (its info handler pushes it on
-                // 'close' before this listener runs) for remote info subscribers -
+                // Keep the connection's final report for remote info subscribers -
                 // closed connections are the main evidence of network-level cuts
                 if (toolSocket.infoHandler && toolSocket.infoHandler.latestReport) {
                     this.infoClosedReports.push(toolSocket.infoHandler.latestReport);
@@ -183,7 +221,48 @@ class ToolSocketServer {
         }
         this.infoSubscribers.clear();
         this.infoAutoEnabled.clear();
+        // shutting down ends every session: no grace, closes surface at once
+        for (const toolSocket of this.sockets) {
+            toolSocket.__ssn.userClosed = true;
+            toolSocket.__ssn.clearGrace();
+        }
+        this.sessions.clear();
         this.server.close();
+    }
+
+    /**
+     * Reads a session migration request out of the upgrade URL.
+     * @param {?http.IncomingMessage} request
+     * @return {?{id: string, gen: number, w: number}}
+     */
+    _parseMigration(request) {
+        if (!request || typeof request.url !== 'string' || request.url.indexOf('tsm=') === -1) {
+            return null;
+        }
+        let value;
+        try {
+            value = new URL(request.url, 'ws://localhost').searchParams.get('tsm');
+        } catch (_e) {
+            return null;
+        }
+        if (!value) {
+            return null;
+        }
+        const match = /^([A-Za-z0-9]{8,64})\.(\d{1,9})\.(\d{1,12})$/.exec(value);
+        if (!match) {
+            return null;
+        }
+        return { id: match[1], gen: parseInt(match[2], 10), w: parseInt(match[3], 10) };
+    }
+
+    _registerSession(toolSocket) {
+        this.sessions.set(toolSocket.__ssn.id, toolSocket);
+    }
+
+    _unregisterSession(toolSocket) {
+        if (this.sessions.get(toolSocket.__ssn.id) === toolSocket) {
+            this.sessions.delete(toolSocket.__ssn.id);
+        }
     }
 
     /**
