@@ -255,6 +255,65 @@ describe('session layer', () => {
         expect(client.connected).toBe(false);
     });
 
+    test('close() on a server session held in grace (transport already closed): the close surfaces at once', async () => {
+        const srv = await startServer(5070);
+        const { client } = await connectClient(5070);
+        await waitFor(() => capable(srv, client));
+        const serverSide = srv.connections[0];
+        client.__ssn.userClosed = true;
+        client._unbindSocket({ terminate: true }); // abnormal cut, no successor will come
+        expect(await waitFor(() => serverSide.__ssn.inGrace(), 1500)).toBe(true);
+        expect(srv.closes.length).toBe(0);
+        // what an application does to a socket it sees as open: the cloud proxy closes every
+        // client of an edge that went away. No close event will come from the wire any more.
+        const t0 = Date.now();
+        serverSide.close();
+        expect(srv.closes.length).toBe(1);
+        expect(Date.now() - t0).toBeLessThan(FAST.graceMs);
+        expect(serverSide.connected).toBe(false);
+        expect(srv.server.sockets).not.toContain(serverSide);
+        expect(srv.server.sessions.has(client.__ssn.id)).toBe(false);
+        await sleep(FAST.graceMs * 2);
+        expect(srv.closes.length).toBe(1); // exactly once: the cancelled grace adds nothing
+    });
+
+    test('close() on a server session whose dead transport was already dropped (stall): no throw, the close surfaces', async () => {
+        const srv = await startServer(5071);
+        const { client } = await connectClient(5071);
+        await waitFor(() => capable(srv, client));
+        const serverSide = srv.connections[0];
+        client.__ssn.userClosed = true; // this client will not dial a successor
+        serverSide._onSessionStall('test'); // the server found the transport dead: drops it, waits in grace
+        expect(serverSide.socket).toBe(null);
+        expect(serverSide.__ssn.inGrace()).toBe(true);
+        expect(() => serverSide.close()).not.toThrow();
+        expect(srv.closes.length).toBe(1);
+        expect(srv.server.sessions.has(client.__ssn.id)).toBe(false);
+        expect(() => serverSide.close()).not.toThrow(); // and a second close() is a no-op
+        expect(srv.closes.length).toBe(1);
+    });
+
+    test('close() on a client between two migration dials: no throw, the close surfaces, no more dialing', async () => {
+        const srv = await startServer(5072);
+        const { client, events } = await connectClient(5072);
+        await waitFor(() => capable(srv, client));
+        // the listener goes away and the transport is cut, without a word (the server's own
+        // close() would say goodbye in-band): nothing answers a successor any more
+        srv.server.server.close();
+        for (const ws of srv.server.server.clients) {
+            ws.terminate();
+        }
+        expect(await waitFor(() => client._migration !== null && client.socket === null, 3000)).toBe(true);
+        expect(client.connected).toBe(true); // the application still sees an open socket
+        expect(() => client.close()).not.toThrow();
+        expect(events.close).toBe(1);
+        expect(client.connected).toBe(false);
+        expect(client._migration).toBe(null);
+        await sleep(FAST.migrateRetryMs * 8);
+        expect(client.socket).toBe(null); // the pending retry was cancelled with the migration
+        expect(events.close).toBe(1);
+    });
+
     test('NB-enhanced pair: a chunked transfer and a burst survive a half-open cut', async () => {
         const srv = await startServer(5048);
         srv.server.addEventListener('connection', socket => NB.enhance(socket, { reconnect: false }));

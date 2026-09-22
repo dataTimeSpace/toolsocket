@@ -249,18 +249,33 @@ class ToolSocket {
      * surfaces the close at once instead of holding the session for a successor. This is the
      * ONLY way a session ends deliberately — a close frame that merely shows up on the wire
      * is treated as a transport loss (see _onTransportClosed).
+     *
+     * A session can be open with NO transport underneath: a server holding it in grace for a
+     * successor, a client between two migration dials. The wire will not report a close then
+     * (there is no raw socket, or it has closed already), and the grace / migration timers
+     * that would have surfaced one are cancelled right here — so the close is surfaced here:
+     * the application closed a socket it saw as open and gets its 'close', exactly once.
      */
     close() {
-        this.__ssn.userClosed = true;
-        this.__ssn.clearGrace();
+        const ssn = this.__ssn;
+        const heldOpen = this._sessionOpen(); // open for the application, whatever the transport
+        ssn.userClosed = true;
+        ssn.clearGrace();
         if (this._migration) {
             this._cancelMigrationTimers();
             this._migration = null;
         }
-        if (this.__ssn.peer === true) {
+        if (ssn.peer === true) {
             this._sendControl('__ts/bye', {});
         }
-        this.socket.close();
+        const ws = this.socket;
+        if (ws && ws.readyState !== WebSocketWrapper.CLOSED) {
+            ws.close(); // its close event surfaces the close (see _onTransportClosed)
+            return;
+        }
+        if (heldOpen) {
+            this._surfaceClose({ code: 1000, reason: 'closed', wasClean: true });
+        }
     }
 
     // ======================================================================================
