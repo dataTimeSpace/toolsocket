@@ -474,6 +474,15 @@ class ToolSocket {
             }
         }
         if (ws) {
+            // Our 'error' handler is gone with the others, but the socket may still report
+            // one: dropped while CONNECTING (a successor whose upgrade never completes, a dial
+            // the watchdog gives up on or connect() replaces), Node's ws emits 'error' on the
+            // next tick, and an EventEmitter with no 'error' listener throws it — the whole
+            // process exits. The socket is discarded, so the error is swallowed here;
+            // browsers never throw on an unheard error.
+            try {
+                ws.addEventListener('error', () => {});
+            } catch (_e) { /* no event target left */ }
             try {
                 if (terminate && ws.terminate) {
                     ws.terminate();
