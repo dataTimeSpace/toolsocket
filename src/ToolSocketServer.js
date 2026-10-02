@@ -202,17 +202,31 @@ class ToolSocketServer {
         }
         this.infoSubscribers.clear();
         this.infoAutoEnabled.clear();
-        // shutting down ends every session deliberately: tell each peer in-band so it does
-        // not try to migrate, and surface every close at once (no grace)
-        for (const toolSocket of this.sockets) {
-            toolSocket.__ssn.userClosed = true;
-            toolSocket.__ssn.clearGrace();
-            if (toolSocket.__ssn.peer === true) {
-                toolSocket._sendControl('__ts/bye', {});
+        // shutting down ends every session deliberately, as close() on each socket does: a
+        // session peer is told in-band so it does not try to migrate, the transport is closed
+        // (the WebSocket server's close() leaves its connections open, so a peer that does not
+        // answer __ts/bye kept its socket), and a session held in grace, with no transport,
+        // surfaces its close at once. A close that never surfaces keeps the socket and what it
+        // holds (e.g. NB's pressure registry entry) for good. A copy, since a surfacing close
+        // takes its socket out of this.sockets.
+        // A close surfaced at once runs the application's close listeners right here: one that
+        // throws must not leave the rest of the sockets, and the server, open. Shutdown
+        // finishes, then the first such error is rethrown to the caller
+        let listenerError = null;
+        for (const toolSocket of this.sockets.slice()) {
+            try {
+                toolSocket.close();
+            } catch (error) {
+                if (listenerError === null) {
+                    listenerError = error;
+                }
             }
         }
         this.sessions.clear();
         this.server.close();
+        if (listenerError !== null) {
+            throw listenerError;
+        }
     }
 
     /**

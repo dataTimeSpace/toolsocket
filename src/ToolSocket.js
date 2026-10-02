@@ -559,17 +559,21 @@ class ToolSocket {
         this._stopWatchdog();
         this.__ssn.releaseRetained();
         this.__ssn.clearGrace();
-        this.triggerEvent('close', event);
-        this.triggerEvent('disconnect', event);
-        this.triggerEvent('status', this.readyState);
-        // internal, after the application's listeners: server-side bookkeeping. A direct
-        // hook rather than an event: an application may wipe a socket's listeners
-        // (removeAllListeners — the cloud proxy does it to a superseded edge socket) and the
-        // server must still forget the session when its grace runs out.
-        if (this.server && this.server._onSessionClosed) {
-            this.server._onSessionClosed(this);
+        try {
+            this.triggerEvent('close', event);
+            this.triggerEvent('disconnect', event);
+            this.triggerEvent('status', this.readyState);
+        } finally {
+            // internal, after the application's listeners: server-side bookkeeping. A direct
+            // hook rather than an event: an application may wipe a socket's listeners
+            // (removeAllListeners — the cloud proxy does it to a superseded edge socket) and the
+            // server must still forget the session when its grace runs out. In a finally for
+            // the same reason: a listener that throws must not leave the server holding it.
+            if (this.server && this.server._onSessionClosed) {
+                this.server._onSessionClosed(this);
+            }
+            this.triggerEvent('__ts:closed', event);
         }
-        this.triggerEvent('__ts:closed', event);
     }
 
     /**

@@ -797,6 +797,11 @@ function enhance(ts, userOpts = {}) {
     // peer, same capability, same transfers — just tune the new raw socket and keep pumping
     ts.addEventListener('__ts:migrated', () => { tuneSocket(); sched.pump(); });
 
+    // Whether a close is the socket's last: an auto-reconnecting outgoing socket comes back
+    // after a close, unless the application closed it (nb.userClosed, see below), while an
+    // incoming socket (url === null) never does
+    const closedForGood = () => !(opts.reconnect && ts.url) || nb.userClosed;
+
     // enroll in the process-wide pressure registry (Node only)
     {
         const Pn = getPressure();
@@ -807,7 +812,7 @@ function enhance(ts, userOpts = {}) {
                 sendHold: (h, sq) => sendInternal('__tsnb/hold', { h: h ? 1 : 0, s: sq, c: Pn.cfg.holdClass }, null, 0)
             };
             Pn._register(entry);
-            ts.addEventListener('close', () => { if (!(opts.reconnect && ts.url)) Pn._unregister(entry); });
+            ts.addEventListener('close', () => { if (closedForGood()) Pn._unregister(entry); });
         }
     }
 
@@ -852,10 +857,9 @@ function enhance(ts, userOpts = {}) {
     // the timer list - a GC root - so without this the interval's closure
     // pins nb/sched/opts and the whole socket forever. Guarded exactly like
     // the pressure entry above: an auto-reconnecting outgoing socket keeps
-    // its gc timer across reconnects, while an incoming socket (url === null)
-    // never comes back and must release it.
+    // its gc timer across reconnects, until it is closed for good.
     if (gc.unref) gc.unref();
-    ts.addEventListener('close', () => { if (!(opts.reconnect && ts.url)) clearInterval(gc); });
+    ts.addEventListener('close', () => { if (closedForGood()) clearInterval(gc); });
 
     // ---------- public backpressure / flow-control API ----------
     ts.getBackpressure = () => sched.stats();
